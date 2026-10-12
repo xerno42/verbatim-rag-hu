@@ -14,15 +14,15 @@ Only some of the spec exists in code. Check before assuming a class is there.
 
 | Piece | Status |
 |---|---|
-| `HungarianBM25Provider` ([verbatim_rag/hungarian_bm25.py](verbatim_rag/hungarian_bm25.py)) | Written, **untracked** in git |
-| Retrieval eval runner ([evaluation/hu_legal/run_retrieval.py](evaluation/hu_legal/run_retrieval.py)) | Written; Recall/MRR for sparse, dense, fused only. No reranking, F1, abstention or assertion metrics yet |
+| `HungarianBM25Provider` ([verbatim_rag/hungarian_bm25.py](verbatim_rag/hungarian_bm25.py)) | Written, committed |
+| Retrieval eval runner ([evaluation/hu_legal/run_retrieval.py](evaluation/hu_legal/run_retrieval.py)) | Written; Recall/MRR for sparse, dense, fused, plus `reranked` with `--rerank` (Jina v3.5 on the fused top-100; not yet run on the eval set). No F1, abstention or assertion metrics yet |
 | Hungarian eval set builder ([evaluation/hu_legal/](evaluation/hu_legal/)) | Committed, with tests |
 | Qwen3-Embedding dense provider (subclass of `SentenceTransformersProvider`, `prompt_name="query"` in `embed_text` only, dim 1024) | Not yet written |
-| `Qwen3Reranker(BaseReranker)` (`Qwen/Qwen3-Reranker-0.6B`, `text_field="text"`, English answerhood instruction, `rerank_k=100` in / top 10 out) | Not yet written |
-| `SentenceRerankExtractor(SpanExtractor)` (HuSpaCy sentence split → Qwen3-Reranker per sentence → threshold) | Not yet written |
+| Reranker: `JinaV3Reranker(BaseReranker)` in [rerankers.py](verbatim_rag/rerankers.py), default `jinaai/jina-reranker-v3.5` (0.6B listwise, CC-BY-NC-4.0, `trust_remote_code`; `rerank_k=100` in, tail kept in retrieval order) | Written, tests mock `transformers`. Replaces the planned `Qwen3Reranker-0.6B`; the sentence-level extractor still needs a per-sentence scorer (listwise scores are only comparable within one call) |
+| `SentenceRerankExtractor(SpanExtractor)` (HuSpaCy sentence split → per-sentence relevance scorer, undecided now that the reranker is listwise Jina → threshold) | Not yet written |
 | Verbatim assertion (every emitted sentence is an exact substring of its source chunk; failure is logged, never shown) and fixed Hungarian abstention message | Not yet written |
 
-Phases: 0 eval set → 1 baseline (Qwen3 + Hungarian BM25 + sentence-rerank extractor, with `LLMSpanExtractor` via an OpenAI-compatible `api_base` as the quality ceiling) → 2 tune weights/cutoffs (4B models only on GPU) → 3 conditional (trained mmBERT/huBERT extractor, or a free-form path with a Hungarian LettuceDetect). Numeric targets are set only after the phase 1 baseline; every change to tokenization, models, weights or thresholds is run against the full eval set and logged with its config.
+Phases: 0 eval set → 1 baseline (Qwen3 + Hungarian BM25 + Jina v3.5 reranker + sentence-rerank extractor, with `LLMSpanExtractor` via an OpenAI-compatible `api_base` as the quality ceiling) → 2 tune weights/cutoffs (4B models only on GPU) → 3 conditional (trained mmBERT/huBERT extractor, or a free-form path with a Hungarian LettuceDetect). Numeric targets are set only after the phase 1 baseline; every change to tokenization, models, weights or thresholds is run against the full eval set and logged with its config.
 
 ## Commands
 
@@ -40,7 +40,7 @@ ruff check packages/core/verbatim_core/ verbatim_rag/ api/ tests/
 ruff format --check packages/core/verbatim_core/ verbatim_rag/ api/ tests/
 
 # Retrieval eval (BM25 / dense / fused; needs spacy, hu_core_news_lg and Qwen3-Embedding; CPU run takes hours)
-python -m evaluation.hu_legal.run_retrieval [--split test] [--limit N] [--skip-dense] [--tag NAME]
+python -m evaluation.hu_legal.run_retrieval [--split test] [--limit N] [--skip-dense] [--rerank] [--tag NAME]
 
 # Build the Hungarian eval set (writes gitignored data/; CC BY-NC-ND 4.0 source licence)
 python -m evaluation.hu_legal.build_eval_set [--revision <hf-sha>] [--seed N]
@@ -88,4 +88,4 @@ Built from the Hungarian slice of the JudicialMind legal dataset. Index each cor
 
 ## Post implementation
 
-Always run the code reviewer agent on the changes and fix its findings. Update this file after changing code in the repo; `AGENTS.md` is a symlink, don't change it. Do not commit the changes you made.
+Always run the code reviewer agent on the changes and fix its findings. Update this file after changing code in the repo; `AGENTS.md` is a symlink, don't change it. Do not commit the changes you made. Do NOT run the eval set.

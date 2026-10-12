@@ -10,7 +10,10 @@ A query is a hit at rank r when any of its gold_chunk_ids (equivalent overlappin
 is the r-th result. Reported per method: Recall@10, Recall@100 and MRR@100, overall and
 split by query_type, legal_domain, difficulty and bucket.
 
-Reranking, extraction and abstention are not implemented yet, so they are not measured.
+With --rerank, the top-100 of the fused list (or of the single method when only one provider
+runs) is reranked by Jina reranker v3.5 and reported as a fourth method, "reranked". It is a
+permutation of the same 100 candidates, so its Recall@100 equals its input's; Recall@10 and
+MRR are what change. Extraction and abstention are not implemented yet, so they are not measured.
 Unanswerable queries are skipped here; only their count is reported.
 
 The index and BM25 stats go under data/ (gitignored, licence). The run log written to
@@ -36,6 +39,7 @@ RUNS = HERE / "runs"
 BREAKDOWNS = ["query_type", "legal_domain", "difficulty", "bucket"]
 CUTOFFS = (10, 100)
 METHODS = ("sparse", "dense", "fused")
+RERANKED = "reranked"
 
 logger = logging.getLogger("hu_legal.run_retrieval")
 
@@ -170,8 +174,20 @@ def build_index(
 # ---- run -------------------------------------------------------------------
 
 
-def run_queries(index, queries: List[Dict[str, Any]], methods: Sequence[str], args) -> List[Dict]:
+def rerank_source(methods: Sequence[str]) -> str:
+    """The method whose top-k feeds the reranker: fused when available, else the only method."""
+    return "fused" if "fused" in methods else methods[0]
+
+
+def run_queries(
+    index,
+    queries: List[Dict[str, Any]],
+    methods: Sequence[str],
+    args,
+    reranker=None,
+) -> List[Dict]:
     k = max(CUTOFFS)
+    source = rerank_source(methods)
     fused_weights = {"dense": args.dense_weight, "sparse": args.sparse_weight}
     rows = []
     for i, q in enumerate(queries, start=1):
@@ -182,6 +198,9 @@ def run_queries(index, queries: List[Dict[str, Any]], methods: Sequence[str], ar
             else:
                 hits = index.query(q["query"], k=k, search_type=method)
             ranks[method] = first_hit_rank([h.id for h in hits], q["gold_chunk_ids"])
+            if reranker is not None and method == source:
+                reranked = reranker.rerank(q["query"], hits)
+                ranks[RERANKED] = first_hit_rank([h.id for h in reranked], q["gold_chunk_ids"])
         rows.append({**{f: q.get(f) for f in BREAKDOWNS}, "ranks": ranks})
         if i % 100 == 0:
             logger.info("queried %d/%d", i, len(queries))
@@ -201,6 +220,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--dense-revision", help="HF commit sha to pin the dense model")
     p.add_argument("--query-instruction", help="English task text replacing Qwen's query prompt")
     p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--rerank", action="store_true", help="Rerank the top-100 with Jina reranker v3.5"
+    )
+    p.add_argument("--rerank-model", default="jinaai/jina-reranker-v3.5")
+    p.add_argument("--rerank-revision", help="HF commit sha to pin the reranker (remote code)")
+    p.add_argument("--rerank-k", type=int, default=max(CUTOFFS), help="Candidates reranked")
     p.add_argument("--bm25-model", default="hu_core_news_lg")
     p.add_argument("--k1", type=float, default=1.2)
     p.add_argument("--b", type=float, default=0.75)
@@ -265,6 +290,19 @@ def main(argv: Optional[List[str]] = None) -> None:
             )
         )
 
+    # Load before indexing so a bad model id or offline machine fails in seconds, not hours.
+    reranker = None
+    if args.rerank:
+        if not args.rerank_revision:
+            logger.warning("--rerank without --rerank-revision: remote code is not pinned")
+        from verbatim_rag.rerankers import JinaV3Reranker
+
+        reranker = JinaV3Reranker(
+            model=args.rerank_model,
+            rerank_k=args.rerank_k,
+            device=args.device,
+            revision=args.rerank_revision,
+        )
     db_path = run_dir / "milvus.db"
     t0 = time.time()
     index = build_index(corpus, db_path, sparse, dense, args.batch_size)
@@ -274,15 +312,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not (sparse and dense):
         methods = [m for m in methods if m != "fused"]
     t0 = time.time()
-    rows = run_queries(index, queries, methods, args)
+    rows = run_queries(index, queries, methods, args, reranker)
     query_seconds = time.time() - t0
 
+    reported = methods + [RERANKED] if reranker is not None else methods
     results = {
         method: {
             "overall": summarize([r["ranks"][method] for r in rows]),
             **{f: breakdown(rows, method, f) for f in BREAKDOWNS},
         }
-        for method in methods
+        for method in reported
     }
     log = {
         "tag": tag,
@@ -311,6 +350,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "sparse_weight": args.sparse_weight,
                 "rrf_k": args.rrf_k,
             },
+            "rerank": None
+            if reranker is None
+            else {
+                "model": args.rerank_model,
+                "revision": args.rerank_revision,  # None = latest at run time; pin it
+                "rerank_k": args.rerank_k,
+                "source": rerank_source(methods),
+            },
             "cutoffs": list(CUTOFFS),
         },
         "dataset": {
@@ -329,7 +376,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     print(f"\n{args.split} split, {len(queries)} answerable queries -> {out}")
     print(f"{'method':8} " + " ".join(f"{m:>11}" for m in ("recall@10", "recall@100", "mrr@100")))
-    for method in methods:
+    for method in reported:
         o = results[method]["overall"]
         print(f"{method:8} {o['recall@10']:11.3f} {o['recall@100']:11.3f} {o['mrr@100']:11.3f}")
     if sparse is not None:

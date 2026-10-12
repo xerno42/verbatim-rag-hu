@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 from verbatim_rag.vector_stores.base import SearchResult
 
@@ -135,30 +135,43 @@ class SentenceTransformersReranker(BaseReranker):
 
 
 class JinaV3Reranker(BaseReranker):
-    """Jina V3 reranker using transformers."""
+    """Local Jina listwise reranker (``jina-reranker-v3.5`` by default)."""
 
     def __init__(
         self,
-        model: str = "jinaai/jina-reranker-v3",
-        rerank_k: int = 50,
+        model: str = "jinaai/jina-reranker-v3.5",
+        rerank_k: int = 100,
         text_field: str = "text",
+        device: Optional[str] = None,
+        revision: Optional[str] = None,
     ):
         super().__init__(rerank_k=rerank_k, text_field=text_field)
         try:
             from transformers import AutoModel
         except ImportError as exc:
             raise ImportError("pip install transformers") from exc
+        self.model_name = model
+        self.revision = revision
         self.model = AutoModel.from_pretrained(
             model,
             dtype="auto",
             trust_remote_code=True,
+            revision=revision,
         )
+        if device is not None:
+            self.model.to(device)
         self.model.eval()
 
     def rerank(self, question: str, results: List[SearchResult]) -> List[SearchResult]:
         head, tail = self._split_results(results)
         if not head:
             return results
-        texts = self._get_texts(head)
-        results = self.model.rerank(question, texts, top_n=self.rerank_k)
-        return [head[item["index"]] for item in results]
+        ranked = self.model.rerank(question, self._get_texts(head))
+        # Sort explicitly: the model card does not state that rerank() output is pre-sorted.
+        ranked = sorted(ranked, key=lambda item: item["relevance_score"], reverse=True)
+        order = [item["index"] for item in ranked]
+        if sorted(order) != list(range(len(head))):
+            raise ValueError(
+                f"Jina reranker returned {len(order)} indices for {len(head)} documents"
+            )
+        return [head[i] for i in order] + tail
