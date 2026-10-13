@@ -13,14 +13,16 @@ split by query_type, legal_domain, difficulty and bucket.
 With --rerank, the top-100 of the fused list (or of the single method when only one provider
 runs) is reranked by Jina reranker v3.5 and reported as a fourth method, "reranked". It is a
 permutation of the same 100 candidates, so its Recall@100 equals its input's; Recall@10 and
-MRR are what change. Extraction and abstention are not implemented yet, so they are not measured.
+MRR are what change. Extraction and abstention are measured by run_extraction.
 Unanswerable queries are skipped here; only their count is reported.
 
-The index and BM25 stats go under data/ (gitignored, licence). The run log written to
-runs/ holds aggregate numbers and the full config only, no corpus text.
+The index and BM25 stats go under data/index/<tag>/ (gitignored, licence), with an
+index_meta.json written once indexing completes so run_extraction --index-tag can reuse it.
+The run log written to runs/ holds aggregate numbers and the full config only, no corpus text.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import random
@@ -30,7 +32,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 HERE = Path(__file__).parent
 DATA = HERE / "data"
@@ -82,6 +84,14 @@ def breakdown(rows: List[Dict[str, Any]], method: str, field: str) -> Dict[str, 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def load_split(path: Path, split: str) -> Tuple[List[Dict[str, Any]], int]:
+    """Queries of one split, minus those annotated as not answered by their own passage
+    (`excluded`: true gold unknown, so not scored). Returns (queries, n_excluded)."""
+    rows = [q for q in read_jsonl(path) if q["split"] == split]
+    kept = [q for q in rows if not q.get("excluded")]
+    return kept, len(rows) - len(kept)
 
 
 class QueryCache:
@@ -171,6 +181,32 @@ def build_index(
     return index
 
 
+INDEX_META = "index_meta.json"
+
+
+def corpus_fingerprint(corpus: List[Dict[str, Any]]) -> str:
+    """Order-independent hash of the (chunk_id, text) pairs."""
+    h = hashlib.sha256()
+    for chunk_id, text in sorted((row["chunk_id"], row["text"]) for row in corpus):
+        h.update(json.dumps([chunk_id, text], ensure_ascii=False).encode("utf-8"))
+    return h.hexdigest()
+
+
+def index_meta(corpus: List[Dict[str, Any]], args, dense: bool, sparse: bool) -> Dict[str, Any]:
+    """What the stored index depends on; written once indexing completes, checked on reuse."""
+    return {
+        "corpus_chunks": len(corpus),
+        "corpus_sha256": corpus_fingerprint(corpus),
+        "chunk_text": "raw corpus text",
+        "dense": {"model": args.dense_model, "revision": args.dense_revision} if dense else None,
+        "bm25": {"model": args.bm25_model, "k1": args.k1, "b": args.b} if sparse else None,
+    }
+
+
+def write_index_meta(run_dir: Path, meta: Dict[str, Any]) -> None:
+    (run_dir / INDEX_META).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
 # ---- run -------------------------------------------------------------------
 
 
@@ -245,8 +281,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     tag = args.tag or started.strftime("%Y%m%d-%H%M%S")
 
     corpus = read_jsonl(args.data_dir / "corpus.jsonl")
-    all_queries = read_jsonl(args.data_dir / "queries.jsonl")
-    split = [q for q in all_queries if q["split"] == args.split]
+    split, n_excluded = load_split(args.data_dir / "queries.jsonl", args.split)
     queries = [q for q in split if q["answerable"]]
     n_unanswerable = len(split) - len(queries)
     if args.limit is not None:
@@ -254,11 +289,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     manifest_path = args.data_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     logger.info(
-        "corpus %d chunks; %s split: %d answerable queries (%d unanswerable skipped)",
+        "corpus %d chunks; %s split: %d answerable queries (%d unanswerable, %d excluded)",
         len(corpus),
         args.split,
         len(queries),
         n_unanswerable,
+        n_excluded,
     )
 
     sparse = dense = None
@@ -307,6 +343,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     t0 = time.time()
     index = build_index(corpus, db_path, sparse, dense, args.batch_size)
     index_seconds = time.time() - t0
+    write_index_meta(run_dir, index_meta(corpus, args, dense is not None, sparse is not None))
 
     methods = [m for m in METHODS if (m != "sparse" or sparse) and (m != "dense" or dense)]
     if not (sparse and dense):
@@ -365,6 +402,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "corpus_chunks": len(corpus),
             "answerable_queries": len(queries),
             "unanswerable_skipped": n_unanswerable,
+            "excluded_by_annotation": n_excluded,
         },
         "empty_sparse_queries": None if sparse is None else sparse.empty,
         "seconds": {"index": round(index_seconds), "query": round(query_seconds)},
