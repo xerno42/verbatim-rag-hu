@@ -64,6 +64,43 @@ passage shares more than 7% of its shingles with any chunk left in the index.
 
 `annotations/` is gitignored too. Check the licence before committing or sharing annotations.
 
+## Extraction eval
+
+```bash
+python -m evaluation.hu_legal.run_extraction --mode oracle --split dev --distractors 2   # crossencoder (bge-reranker-v2-m3), thresholds 0.3–0.9
+python -m evaluation.hu_legal.run_extraction --mode oracle --extractor llm --api-base http://localhost:8000/v1
+python -m evaluation.hu_legal.run_extraction --mode retrieved --index-tag baseline --rerank
+```
+
+`oracle` gives the extractor each answerable query's own passage and nothing else, so it measures
+the extractor alone. On its own that cannot tell a good judge from one that says yes to everything,
+since the passage is the answer source. `--distractors N` adds N hard negatives per query: chunks of
+the same document that share no 8-word shingle with the passage, so they cannot contain its text.
+It then reports `distractor_answer_rate`, gold-chunk span precision and, for crossencoder and
+overlap, `chunk_auc` (how often the gold passage's best sentence outscores a distractor's best).
+The crossencoder scores are a sigmoid over the model's logit, so they lie in [0, 1]. `chunk_auc` doesn't
+depend on the threshold, which makes it the number for comparing judge variants. Same-document
+distractors can still be on-topic, so treat these as relative numbers, not absolute precision.
+`--extractor overlap` scores sentences by plain word overlap with the question, without a model:
+it is the floor any judge variant has to beat.
+
+`retrieved` runs retrieval → optional rerank → extraction (not `VerbatimRAG.query`: no templates,
+no `max_display_spans`) over every query of the split, including unanswerable ones, and adds abstention accuracy. It also reports whether a gold chunk reached the
+extractor (`gold_in_context`), so retrieval misses can be told apart from extraction misses.
+`--index-tag` reuses an index from `run_retrieval` or an earlier extraction run, but only when its
+`index_meta.json` matches the corpus content and provider settings. Without it, the runner builds
+a fresh index under `data/index/<tag>/`, which takes hours on CPU. It refuses to overwrite a
+completed index there unless you pass `--overwrite`. Queries annotated `"no"` (`excluded`) are not
+scored by either runner. With `--extractor llm`, failed API calls are reported as
+`extractor_errors` instead of being counted as abstentions.
+
+Word-level F1 needs `gold_spans`, so it reports `n_gold=0` until the annotation pass above is
+merged. Until then, use `gold_answer_rate`, coverage, `distractor_answer_rate`, gold-chunk span
+precision and `chunk_auc`. Use the dev split
+to pick the crossencoder threshold, and report test only once. Run logs go to
+`runs/extraction-<tag>.json` as aggregates only. `--dump-predictions` writes per-query spans and
+scores to `data/predictions/` for error analysis.
+
 ## Caveats
 
 - Queries are synthetic and some don't match their passage. For example, a query may ask about
