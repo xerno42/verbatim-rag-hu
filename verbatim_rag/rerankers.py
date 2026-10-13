@@ -154,7 +154,8 @@ class JinaV3Reranker(BaseReranker):
         self.revision = revision
         self.model = AutoModel.from_pretrained(
             model,
-            dtype="auto",
+            # transformers is pinned to 4.53.3, which predates the `dtype` alias (4.56)
+            torch_dtype="auto",
             trust_remote_code=True,
             revision=revision,
         )

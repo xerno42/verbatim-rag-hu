@@ -45,6 +45,9 @@ class TestJinaV3Reranker:
         assert args[0] == "jinaai/jina-reranker-v3.5"
         assert kwargs["trust_remote_code"] is True
         assert kwargs["revision"] is None
+        # The pinned transformers (4.53.3) forwards an unknown `dtype` kwarg to the model __init__
+        assert kwargs["torch_dtype"] == "auto"
+        assert "dtype" not in kwargs
         model.eval.assert_called_once()
         model.to.assert_not_called()
 
