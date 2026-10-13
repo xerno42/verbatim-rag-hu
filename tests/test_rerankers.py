@@ -33,8 +33,16 @@ def fake_auto_model():
     auto.from_pretrained.return_value = model
     module = types.ModuleType("transformers")
     module.AutoModel = auto
+    module.AutoTokenizer = MagicMock()
     with patch.dict(sys.modules, {"transformers": module}):
         yield auto, model
+
+
+@pytest.fixture
+def fake_tokenizer(fake_auto_model):
+    tokenizer = MagicMock(pad_token="<pad>", model_max_length=131072)
+    sys.modules["transformers"].AutoTokenizer.from_pretrained.return_value = tokenizer
+    return sys.modules["transformers"].AutoTokenizer, tokenizer
 
 
 class TestJinaV3Reranker:
@@ -56,6 +64,47 @@ class TestJinaV3Reranker:
         JinaV3Reranker(revision="abc123", device="cuda")
         assert auto.from_pretrained.call_args.kwargs["revision"] == "abc123"
         model.to.assert_called_once_with("cuda")
+
+    def test_tokenizer_is_pinned_to_the_revision(self, fake_auto_model, fake_tokenizer):
+        _, model = fake_auto_model
+        auto_tokenizer, tokenizer = fake_tokenizer
+        JinaV3Reranker(revision="abc123")
+        args, kwargs = auto_tokenizer.from_pretrained.call_args
+        assert args[0] == "jinaai/jina-reranker-v3.5"
+        assert kwargs["revision"] == "abc123"
+        assert model._tokenizer is tokenizer
+        assert tokenizer.padding_side == "left"
+        assert tokenizer.model_max_length == 131072
+
+    def test_missing_pad_token_falls_back_to_unk(self, fake_auto_model, fake_tokenizer):
+        _, tokenizer = fake_tokenizer
+        tokenizer.pad_token = None
+        tokenizer.unk_token = "<unk>"
+        JinaV3Reranker()
+        assert tokenizer.pad_token == "<unk>"
+        tokenizer.convert_tokens_to_ids.assert_called_once_with("<unk>")
+
+    def test_max_block_tokens_sets_the_packing_capacity(self, fake_auto_model, fake_tokenizer):
+        _, tokenizer = fake_tokenizer
+        JinaV3Reranker(revision="abc123", max_block_tokens=4096)
+        assert tokenizer.model_max_length == 4096 + JinaV3Reranker._MAX_DOC_LENGTH
+
+    def test_max_block_tokens_warns_when_unpinned_or_tiny(self, fake_auto_model, caplog):
+        with caplog.at_level("WARNING", logger="verbatim_rag.rerankers"):
+            JinaV3Reranker(max_block_tokens=512)
+        assert "pinned revision" in caplog.text
+        assert "own block" in caplog.text
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_non_positive_max_block_tokens_raises(self, fake_auto_model, value):
+        with pytest.raises(ValueError, match="max_block_tokens"):
+            JinaV3Reranker(max_block_tokens=value)
+
+    def test_max_block_tokens_needs_the_jina_remote_code(self, fake_auto_model):
+        _, model = fake_auto_model
+        del model._ensure_tokenizer
+        with pytest.raises(RuntimeError, match="_ensure_tokenizer"):
+            JinaV3Reranker(max_block_tokens=4096)
 
     def test_default_rerank_k_is_100(self, fake_auto_model):
         assert JinaV3Reranker().rerank_k == 100

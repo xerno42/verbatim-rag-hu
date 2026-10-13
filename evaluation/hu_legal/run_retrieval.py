@@ -226,6 +226,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--rerank-model", default="jinaai/jina-reranker-v3.5")
     p.add_argument("--rerank-revision", help="HF commit sha to pin the reranker (remote code)")
     p.add_argument("--rerank-k", type=int, default=max(CUTOFFS), help="Candidates reranked")
+    p.add_argument(
+        "--rerank-block-tokens",
+        type=int,
+        help="Approximate cap on tokens per reranker forward pass (4096 fits a 16 GB GPU); "
+        "default: all candidates in one pass",
+    )
     p.add_argument("--bm25-model", default="hu_core_news_lg")
     p.add_argument("--k1", type=float, default=1.2)
     p.add_argument("--b", type=float, default=0.75)
@@ -237,6 +243,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--tag", help="Name for this run; also names the index dir under data/")
     p.add_argument("--runs-dir", type=Path, default=RUNS)
     args = p.parse_args(argv)
+    if args.rerank_block_tokens is not None and not args.rerank:
+        p.error("--rerank-block-tokens needs --rerank")
     if args.skip_dense and args.skip_sparse:
         p.error("nothing to run: both providers skipped")
 
@@ -302,6 +310,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             rerank_k=args.rerank_k,
             device=args.device,
             revision=args.rerank_revision,
+            max_block_tokens=args.rerank_block_tokens,
         )
     db_path = run_dir / "milvus.db"
     t0 = time.time()
@@ -356,6 +365,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "model": args.rerank_model,
                 "revision": args.rerank_revision,  # None = latest at run time; pin it
                 "rerank_k": args.rerank_k,
+                "max_block_tokens": args.rerank_block_tokens,
                 "source": rerank_source(methods),
             },
             "cutoffs": list(CUTOFFS),
