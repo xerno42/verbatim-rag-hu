@@ -101,6 +101,40 @@ to pick the crossencoder threshold, and report test only once. Run logs go to
 `runs/extraction-<tag>.json` as aggregates only. `--dump-predictions` writes per-query spans and
 scores to `data/predictions/` for error analysis.
 
+## Demo
+
+```bash
+python -m evaluation.hu_legal.demo --index-tag baseline              # crossencoder only
+DEEPSEEK_API_KEY=... python -m evaluation.hu_legal.demo --index-tag baseline --extractors crossencoder,llm
+cd frontend && npm install && npm run dev                            # http://localhost:3000
+```
+
+`demo.py` serves the retrieved-mode pipeline to the React UI in `frontend/`, with an eval-query
+picker, gold-chunk marks and a verdict per query (answered from a gold chunk, correct abstention,
+retrieval miss, and so on). The pipeline is fused retrieval of the top 100, the Jina v3.5 rerank,
+extraction on the top 5, and a static Hungarian template, so no LLM writes text. The defaults fit
+a 16 GB GPU: `--device cuda --batch-size 32 --rerank-block-tokens 4096`.
+
+The extractor can be switched per query in the UI:
+- `crossencoder` is the default, at `--ce-threshold 0.5`.
+- `llm` is `LLMSpanExtractor`, by default `deepseek-v4-flash` at `https://api.deepseek.com/v1`,
+  with the key in `$DEEPSEEK_API_KEY`. It is opt-in because every query sends its top chunks to
+  that API. No extraction run with that model has been logged yet.
+
+The server reuses `data/index/<tag>/` only when `index_meta.json` matches. Pass `--build` to
+build an index when none is complete. The server never rebuilds a completed one.
+
+Behavior worth knowing during a demo:
+- Spans that fail the verbatim check are dropped and logged.
+- Failed LLM calls and reranker errors are shown as errors, never as abstentions.
+- An answer with no spans gets a fixed Hungarian abstention message.
+
+The server opens port 8000 only after every model has loaded. Until then, Vite logs
+`http proxy error ... ECONNREFUSED 127.0.0.1:8000` every few seconds and the UI shows
+"Loading...". The UI connects on its own once the server logs `Uvicorn running on`.
+
+Corpus and queries are CC BY-NC-ND 4.0. The server binds to `127.0.0.1`, so keep it local.
+
 ## Caveats
 
 - Queries are synthetic and some don't match their passage. For example, a query may ask about

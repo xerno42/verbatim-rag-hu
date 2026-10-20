@@ -10,6 +10,7 @@ import { Input } from './ui/input.jsx';
 import { ScrollArea } from './ui/scroll-area.jsx';
 import { TooltipProvider, Tooltip, TooltipTrigger, TooltipContent } from './ui/tooltip.jsx';
 import { useApi } from '../contexts/ApiContext';
+import { ExtractorToggle, EvalQueryPicker, EvalResult, isGoldChunk } from './HuDemoPanels.jsx';
 
 // Markdown components with custom styling
 const MarkdownComponents = {
@@ -49,8 +50,13 @@ const MarkdownComponents = {
 };
 
 const CleanFactInterface = () => {
-  const { isLoading, isResourcesLoaded, currentQuery, submitQuery, resetQuery } = useApi();
+  const {
+    isLoading, isResourcesLoaded, currentQuery, submitQuery, resetQuery, error,
+    demo, evalQueries, extractor, setExtractor,
+  } = useApi();
   const [question, setQuestion] = useState('');
+  // Eval query the question box was filled from; dropped once the text is edited
+  const [selectedEvalQuery, setSelectedEvalQuery] = useState(null);
   const [selectedDocument, setSelectedDocument] = useState(0);
   const [highlightedFactId, setHighlightedFactId] = useState(null);
   const documentScrollRef = useRef(null);
@@ -59,14 +65,22 @@ const CleanFactInterface = () => {
     e.preventDefault();
     if (!question.trim() || !isResourcesLoaded) return;
 
-    await submitQuery(question);
-    setQuestion('');
+    const evalQuery = selectedEvalQuery?.query === question ? selectedEvalQuery : null;
     setSelectedDocument(0);
+    await submitQuery(question, evalQuery);
+    setQuestion('');
+    setSelectedEvalQuery(null);
+  };
+
+  const pickEvalQuery = (query) => {
+    setQuestion(query.query);
+    setSelectedEvalQuery(query);
   };
 
   const goHome = () => {
     resetQuery();
     setQuestion('');
+    setSelectedEvalQuery(null);
     setSelectedDocument(0);
   };
 
@@ -351,7 +365,18 @@ const CleanFactInterface = () => {
                 )}
                 
                 {/* Chunk content */}
-                <div className="bg-card border border-border rounded-lg p-4 lg:p-6">
+                <div className={`bg-card border rounded-lg p-4 lg:p-6 ${
+                  isGoldChunk(currentQuery?.evalQuery, chunk) ? 'border-green-600 border-2' : 'border-border'
+                }`}>
+                  {demo && (
+                    <div className="flex flex-wrap items-center gap-2 mb-3 text-xs text-muted-foreground">
+                      <span>Rank {chunk.originalIndex + 1}</span>
+                      <span className="font-mono break-all">{chunk.metadata?.chunk_id}</span>
+                      {isGoldChunk(currentQuery?.evalQuery, chunk) && (
+                        <Badge className="bg-green-600 hover:bg-green-600">gold</Badge>
+                      )}
+                    </div>
+                  )}
                   <div className="text-base lg:text-lg leading-7 lg:leading-8 text-foreground max-w-full overflow-hidden">
                     {parts.map((part, index) => {
                       if (part.type === 'highlight') {
@@ -422,9 +447,12 @@ const CleanFactInterface = () => {
             <h1 className="text-xl lg:text-2xl font-bold text-foreground">KR Labs <span className="text-muted-foreground">•</span> Verbatim RAG</h1>
           </button>
 
-          <Badge variant={isResourcesLoaded ? "default" : "secondary"}>
-            {isResourcesLoaded ? '✓ Ready' : '⏳ Loading...'}
-          </Badge>
+          <div className="flex items-center gap-2">
+            {demo && <Badge variant="outline">HU legal eval demo</Badge>}
+            <Badge variant={isResourcesLoaded ? "default" : "secondary"}>
+              {isResourcesLoaded ? '✓ Ready' : '⏳ Loading...'}
+            </Badge>
+          </div>
         </div>
       </header>
 
@@ -438,7 +466,9 @@ const CleanFactInterface = () => {
             <div className="mb-8">
               <form onSubmit={handleSubmit} className="space-y-4 lg:space-y-5">
                 <label className="block text-xl lg:text-2xl font-medium text-foreground mb-4">
-                  Ask a question about your documents
+                  {demo
+                    ? 'Ask a question about the Hungarian legal corpus'
+                    : 'Ask a question about your documents'}
                 </label>
                 <div className="flex gap-3 lg:gap-4">
                   <Input
@@ -459,8 +489,30 @@ const CleanFactInterface = () => {
                 <p className="text-sm lg:text-base text-muted-foreground">
                   Answers include exact citations from your document collection
                 </p>
+                {demo && (
+                  <>
+                    <ExtractorToggle
+                      demo={demo}
+                      extractor={extractor}
+                      setExtractor={setExtractor}
+                      disabled={isLoading}
+                    />
+                    <EvalQueryPicker
+                      demo={demo}
+                      queries={evalQueries}
+                      onPick={pickEvalQuery}
+                      disabled={isLoading}
+                    />
+                  </>
+                )}
               </form>
             </div>
+
+            {error && (
+              <div role="alert" className="mb-8 border border-destructive bg-destructive/10 text-destructive rounded-lg p-4 text-sm lg:text-base">
+                {error}
+              </div>
+            )}
 
             {/* Answer section */}
             <AnimatePresence>
@@ -500,6 +552,8 @@ const CleanFactInterface = () => {
                       </CardContent>
                     </Card>
                   )}
+
+                  {currentQuery.answer && <EvalResult currentQuery={currentQuery} />}
                 </motion.div>
               )}
 
@@ -519,7 +573,7 @@ const CleanFactInterface = () => {
                   </p>
 
                   {/* Sample Questions */}
-                  {isResourcesLoaded && (
+                  {isResourcesLoaded && !demo && (
                     <div className="max-w-3xl mx-auto space-y-3 lg:space-y-4">
                       <p className="text-sm lg:text-base text-muted-foreground font-medium mb-4">Try these example questions:</p>
                       {[

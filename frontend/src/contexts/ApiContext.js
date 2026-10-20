@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef } from 'react';
 import axios from 'axios';
 
+const STATUS_POLL_MS = 3000;
+
 // Create context
 const ApiContext = createContext();
 
@@ -14,33 +16,68 @@ export const ApiProvider = ({ children }) => {
   const [isResourcesLoaded, setIsResourcesLoaded] = useState(false);
   const [currentQuery, setCurrentQuery] = useState(null);
   const [numDocs, setNumDocs] = useState(5); // Default to 5 documents
+  // Hungarian eval demo (evaluation/hu_legal/demo.py); null against the generic API
+  const [demo, setDemo] = useState(null);
+  const [evalQueries, setEvalQueries] = useState([]);
+  const [extractor, setExtractor] = useState(null);
 
   // Add a ref to track document updates
   const documentUpdateTimeoutRef = useRef(null);
   
-  // Function to check if resources are loaded
+  // One status check; returns whether the server is ready. "Not up yet" (connection
+  // refused: Vite's empty 500, nginx's 502) stays silent; an error the API itself reports
+  // ({detail}, e.g. a failed RAG init) is shown in the banner.
   const refreshStatus = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-    
     try {
       const response = await axios.get('/api/status');
-      setIsResourcesLoaded(response.data.resources_loaded);
+      const ready = response.data?.resources_loaded === true;
+      setIsResourcesLoaded(ready);
+      if (ready) setError(null);
+      return ready;
     } catch (err) {
-      const errorMessage = err.response?.data?.detail || err.message;
-      setError(errorMessage);
-    } finally {
-      setIsLoading(false);
+      const detail = err.response?.data?.detail;
+      if (typeof detail === 'string') setError(detail);
+      return false;
     }
   }, []);
 
-  // Check if resources are loaded on mount
+  // Poll until ready: the API (and the demo server, which binds only after loading its
+  // models) may start after the page. One request at a time, with no timeout, because the
+  // generic API builds its models inside the first /api/status call.
   useEffect(() => {
-    refreshStatus();
-  }, [refreshStatus]);
+    if (isResourcesLoaded) return undefined;
+    let cancelled = false;
+    let timer = null;
+    const loop = async () => {
+      const ready = await refreshStatus();
+      if (!cancelled && !ready) timer = setTimeout(loop, STATUS_POLL_MS);
+    };
+    loop();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [isResourcesLoaded, refreshStatus]);
 
-  // Submit a query
-  const submitQuery = useCallback(async (question) => {
+  // Detect the demo server once the API answers; the generic API has no /api/demo routes
+  // (404 → stay null)
+  useEffect(() => {
+    if (!isResourcesLoaded) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const config = (await axios.get('/api/demo/config')).data;
+        if (cancelled || !Array.isArray(config?.extractors) || !config.extractors.length) return;
+        setDemo(config);
+        setExtractor(config.default_extractor);
+        const payload = (await axios.get('/api/demo/queries')).data;
+        if (!cancelled) setEvalQueries(Array.isArray(payload?.queries) ? payload.queries : []);
+      } catch (err) {
+        if (err.response?.status !== 404) console.error('Demo config failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isResourcesLoaded]);
+
+  // Submit a query; evalQuery is the eval-set query it came from, if any (for gold marks)
+  const submitQuery = useCallback(async (question, evalQuery = null) => {
     if (!isResourcesLoaded) {
       setError('Resources not loaded. Please wait for the system to initialize.');
       return null;
@@ -52,6 +89,8 @@ export const ApiProvider = ({ children }) => {
     // Create an initial query result structure
     setCurrentQuery({
       question,
+      evalQuery,
+      extractor: demo ? extractor : null,
       documents: [],
       answer: null,
       structured_answer: null
@@ -68,12 +107,19 @@ export const ApiProvider = ({ children }) => {
         },
         body: JSON.stringify({
           question,
-          num_docs: numDocs
+          num_docs: numDocs,
+          ...(demo ? { extractor } : {})
         })
       });
-      
+
       if (!response.ok) {
-        throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
+        let detail = response.statusText;
+        try {
+          detail = (await response.json()).detail || detail;
+        } catch (e) {
+          // body is not JSON; keep the status text
+        }
+        throw new Error(`Server responded with ${response.status}: ${detail}`);
       }
       
       const reader = response.body.getReader();
@@ -160,7 +206,10 @@ export const ApiProvider = ({ children }) => {
                   setIsLoading(false);
                 }
                 break;
-                
+
+              case 'progress':
+                break;
+
               default:
                 console.warn('Unknown response type:', data.type);
             }
@@ -206,7 +255,7 @@ export const ApiProvider = ({ children }) => {
     } finally {
       setIsLoading(false);
     }
-  }, [isResourcesLoaded, numDocs]);
+  }, [isResourcesLoaded, numDocs, demo, extractor]);
 
   // Load resources with optional API key
   const loadResources = useCallback(async (apiKey = null) => {
@@ -241,6 +290,7 @@ export const ApiProvider = ({ children }) => {
   // Reset current query
   const resetQuery = useCallback(() => {
     setCurrentQuery(null);
+    setError(null);
   }, []);
 
   // Force UI updates when documents change
@@ -278,6 +328,10 @@ export const ApiProvider = ({ children }) => {
     updateNumDocs,
     resetQuery,
     refreshStatus,
+    demo,
+    evalQueries,
+    extractor,
+    setExtractor,
   };
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>;
