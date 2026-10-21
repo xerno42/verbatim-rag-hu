@@ -1,370 +1,347 @@
-# Verbatim RAG
+# Verbatim RAG HU
 
-<p align="center">
-  <img src="https://github.com/KRLabsOrg/verbatim-rag/blob/main/assets/chiliground.png?raw=true" alt="ChiliGround Logo" width="400"/>
-  <br><em>Chill, I Ground! 🌶 ️</em>
-</p>
+A Hungarian-language fork of [VerbatimRAG](https://github.com/KRLabsOrg/verbatim-rag)
+(KR Labs): extractive question answering where every answer sentence is copied
+verbatim from a source chunk and cited in the response. No LLM
+writes factual content, so hallucination is prevented by construction instead of
+detected afterwards.
 
-Provenance-first extractive RAG: retrieve documents, select answer-relevant
-passages, and return source excerpts with citations instead of freely rewriting
-the evidence.
+The fork keeps the upstream pipeline (`DocumentProcessor`, `VerbatimIndex`,
+`LocalMilvusStore`, templates, response builder) as implemented and swaps four
+components through its existing interfaces:
 
-[![PyPI](https://img.shields.io/pypi/v/verbatim-rag)](https://pypi.org/project/verbatim-rag/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1IACXwo3ezgA1yXarxVOC4yXjdUPmOI1H?usp=sharing)
-[![ACL 2025](https://img.shields.io/badge/ACL%20Anthology-2025.bionlp--share.8-blue)](https://aclanthology.org/2025.bionlp-share.8/)
-[![arXiv](https://img.shields.io/badge/arXiv-2605.21102-b31b1b.svg)](https://arxiv.org/abs/2605.21102)
-[![HF Collection](https://img.shields.io/badge/🤗%20HuggingFace-verbatim--rag--v1-yellow)](https://huggingface.co/collections/KRLabsOrg/verbatim-rag-v1)
-
-## Concept
-
-Traditional RAG systems retrieve relevant documents and then allow an LLM to
-freely generate a response. Verbatim RAG reduces that generative surface by
-selecting and displaying passages from retrieved context.
-
-Built-in verified extraction paths return evidence text from the supplied
-source. This is a provenance guarantee, not a truth guarantee: retrieval may be
-incomplete, a source may be wrong, and an extractor may choose an irrelevant or
-incomplete passage. The default contextual template may also generate
-presentation text around cited excerpts; use `template_mode="static"` when the
-framing must be fixed and deterministic.
-
-On the paper's 100-row ACL-Verbatim benchmark, the 150M-parameter
-ACL-specialized model achieved **53.6 micro Word-F1**, compared with **48.7** for
-the strongest evaluated LLM extractor. In the generic v2
-[model-card evaluation](https://huggingface.co/KRLabsOrg/verbatim-rag-modern-bert-v2),
-v2 achieved higher micro Word-F1 than the evaluated Zilliz Semantic Highlight
-and Provence baselines on ACL, RAGBench, Squeez, and QASPER slices. See the
-[paper](https://arxiv.org/abs/2605.21102) for the benchmark design and
-limitations.
-
-The pipeline can also use local encoder models for retrieval and extraction plus
-static rendering, without generative LLM API calls. With SPLADE and
-`ModelSpanExtractor`, that configuration supports CPU execution after model
-weights are available.
-
-## What "verbatim" means
-
-| Property | Built-in exact/static path | Outside the guarantee |
+| Component | Upstream (default or typical) | This fork |
 |---|---|---|
-| Evidence text | Returned from retrieved source text | Custom/structured extractors must enforce their own contract |
-| Rendering | Exact excerpts plus fixed transparent framing | Contextual mode can generate introductions, labels, and connective text |
-| Citations | Source citations and highlights are returned | Repeated identical text can still make source-offset mapping ambiguous |
-| Correctness | Provenance can be inspected | Source truth, retrieval recall, relevance, completeness, and entailment |
+| Dense embeddings | MiniLM-class sentence-transformers | `Qwen/Qwen3-Embedding-0.6B` |
+| Sparse embeddings | SPLADE | Hungarian BM25 over HuSpaCy lemmas |
+| Reranker | English cross-encoder | `jinaai/jina-reranker-v3.5` |
+| Span extractor | LLM or ModernBERT span model | HuSpaCy sentence split + `BAAI/bge-reranker-v2-m3` or an LLM as a sentence judge |
+
+Everything runs on one machine with Milvus Lite. The evaluation set is the
+Hungarian slice of a legal dataset (EU law), described under [Dataset](#dataset).
+
+**Status.** The retrieval stack, the cross-encoder extractor, the evaluation
+runners and the eval-set demo are implemented. A trained Hungarian extractor is a possible
+later phase and does not exist yet. The `api/` and `frontend/` code inherited from
+upstream is a prototype outside this fork's scope; the frontend is reused only for
+the eval-set demo.
 
 ## Installation
 
-```bash
-# Install the package
-pip install verbatim-rag
-```
-
-For local development:
+Requires Python 3.10 or newer.
 
 ```bash
-pip install -e packages/core/
-pip install -e .
+git clone https://github.com/xerno42/verbatim-rag.git
+cd verbatim-rag
+python -m venv .venv && source .venv/bin/activate
+
+pip install -e packages/core/        # verbatim_rag imports verbatim_core from here
+pip install -e ".[dev]"
+
+# HuSpaCy model used for lemmas (BM25) and sentence boundaries (extraction)
+python -c "import huspacy; huspacy.download('hu_core_news_lg')"
+# if that fails (e.g. "Invalid wheel filename ... hu_core_news_lg-any-py3-none-any"),
+# which is what happens when pip resolves an old huspacy such as 0.5.1 (seen on Python 3.14):
+pip install https://huggingface.co/huspacy/hu_core_news_lg/resolve/main/hu_core_news_lg-3.8.1-py3-none-any.whl
 ```
 
-## Lightweight Core
+The demo frontend needs Node.js: `cd frontend && npm install`.
 
-If you only need the reusable verbatim core without the full RAG pipeline (no torch, transformers, or Milvus):
+Model weights (Qwen3-Embedding, Jina reranker, bge-reranker) are downloaded from
+Hugging Face on first use.
 
 ```bash
-pip install verbatim-core
+pytest tests/ -v                      # network-free tests, same as CI
+ruff check packages/core/verbatim_core/ verbatim_rag/ api/ tests/
+ruff format --check packages/core/verbatim_core/ verbatim_rag/ api/ tests/
 ```
-
-```python
-from verbatim_core import VerbatimTransform
-
-vt = VerbatimTransform()
-response = vt.transform(
-    question="What is the main finding?",
-    context=[
-        {"content": "The study found that X leads to Y.", "title": "Paper A"},
-        {"content": "Results show Z is significant.", "title": "Paper B"},
-    ],
-)
-print(response.answer)
-```
-
-Dependencies: only `openai`, `pydantic`, `rapidfuzz`, and `jinja2`.
 
 ## Repository map
 
-| Surface | Location | Responsibility |
-|---|---|---|
-| `verbatim-core` | This repository, `packages/core/` | Reusable question + context → evidence transform, validation, templates, citations |
-| `verbatim-rag` | This repository, `verbatim_rag/` | Reference ingestion, indexing, retrieval, and orchestration pipeline |
-| Research/training | [`KRLabsOrg/acl-verbatim`](https://github.com/KRLabsOrg/acl-verbatim) | Paper reproduction, v2 training, datasets, and canonical evaluation |
-| Hosted client | [`KRLabsOrg/verbatim-client`](https://github.com/KRLabsOrg/verbatim-client) | SDK and CLI for hosted Verbatim services |
-| Agent adapters | [`KRLabsOrg/verbatim-mcp`](https://github.com/KRLabsOrg/verbatim-mcp), [`KRLabsOrg/verbatim-skill`](https://github.com/KRLabsOrg/verbatim-skill) | Thin MCP and agent integrations |
+| Path | Contents |
+|---|---|
+| [verbatim_rag/hungarian_bm25.py](verbatim_rag/hungarian_bm25.py) | `HungarianBM25Provider`: client-side BM25 over HuSpaCy lemmas |
+| [verbatim_rag/qwen3_embedding.py](verbatim_rag/qwen3_embedding.py) | `Qwen3EmbeddingProvider`: dense provider with the Qwen3 query prompt |
+| [verbatim_rag/rerankers.py](verbatim_rag/rerankers.py) | `JinaV3Reranker` (plus the upstream rerankers) |
+| [verbatim_rag/cross_encoder_extractor.py](verbatim_rag/cross_encoder_extractor.py) | `CrossEncoderSentenceExtractor`: sentence-level span extractor |
+| [verbatim_rag/](verbatim_rag/) (rest) | Upstream pipeline: `VerbatimRAG`, `VerbatimIndex`, ingestion, vector stores, templates |
+| [packages/core/verbatim_core/](packages/core/verbatim_core/) | Upstream lightweight core: span extractors, `LLMClient`, templates, response builder |
+| [evaluation/hu_legal/](evaluation/hu_legal/) | Eval set builder, retrieval and extraction runners, demo server, run logs (`runs/`). See its [README](evaluation/hu_legal/README.md) |
+| [frontend/](frontend/) | Upstream React UI, extended with the demo panels ([HuDemoPanels.jsx](frontend/src/components/HuDemoPanels.jsx)) |
+| [tests/](tests/) | Network-free tests; Hungarian ones are `test_hu_*.py`, `test_hungarian_bm25.py`, `test_qwen3_embedding.py`, `test_cross_encoder_extractor.py`, `test_rerankers.py` |
 
-## Quick Start
+## Quick start
 
-```python
-from verbatim_rag import VerbatimIndex, VerbatimRAG
-from verbatim_rag.ingestion import DocumentProcessor
-from verbatim_rag.vector_stores import LocalMilvusStore
-from verbatim_rag.embedding_providers import SpladeProvider
-
-# Process documents with intelligent chunking
-processor = DocumentProcessor()
-
-# Process PDFs from URLs
-document = processor.process_url(
-    url="https://aclanthology.org/2025.bionlp-share.8.pdf",
-    title="KR Labs at ArchEHR-QA 2025: A Verbatim Approach for Evidence-Based Question Answering",
-    metadata={"authors": ["Adam Kovacs", "Paul Schmitt", "Gabor Recski"]}
-)
-
-# Create embedding provider and vector store
-sparse_provider = SpladeProvider(
-    model_name="opensearch-project/opensearch-neural-sparse-encoding-doc-v2-distill",
-    device="cpu"
-)
-vector_store = LocalMilvusStore(
-    db_path="./index.db",
-    collection_name="verbatim_rag",
-    enable_dense=False,
-    enable_sparse=True,
-)
-
-# Create index with providers
-index = VerbatimIndex(
-    vector_store=vector_store,
-    sparse_provider=sparse_provider
-)
-index.add_documents([document])
-
-# Then query the index
-rag = VerbatimRAG(index)
-
-response = rag.query("What is the main contribution of the paper?")
-print(response.answer)
-```
-
-
-### Environment Setup
-
-Set your OpenAI API key before using the system:
+The quickest end-to-end path uses the eval set: build it, index it, measure
+retrieval, and open the demo.
 
 ```bash
-export OPENAI_API_KEY=your_api_key_here
+# 1. Build the Hungarian eval set into data
+python -m evaluation.hu_legal.build_eval_set
+
+# 2. Index the corpus and measure retrieval (BM25 / dense / fused / reranked).
+python -m evaluation.hu_legal.run_retrieval --split test --tag baseline --rerank
+
+# 3. Run the demo on that index (see "Demo")
+python -m evaluation.hu_legal.demo --index-tag baseline
 ```
 
-## How It Works
+To query an existing index from Python, call the retrieval, rerank and extraction
+stages directly. This is what `run_extraction --mode retrieved --rerank` does.
 
-1. **Document Processing**: Documents are processed using docling for format conversion and chonkie for chunking
-2. **Document Indexing**: Documents are indexed using vector embeddings (both dense and sparse)
-3. **Template Management**: Response templates are created and stored for common question types
-4. **Query Processing**: 
-   - Relevant documents are retrieved
-   - Key passages are extracted verbatim using either LLM-based or fine-tuned span extractors
-   - Responses are structured using templates
-   - Citations link back to source documents
+```python
+from verbatim_rag.cross_encoder_extractor import CrossEncoderSentenceExtractor
+from verbatim_rag.hungarian_bm25 import HungarianBM25Provider
+from verbatim_rag.index import VerbatimIndex
+from verbatim_rag.qwen3_embedding import Qwen3EmbeddingProvider
+from verbatim_rag.rerankers import JinaV3Reranker
+from verbatim_rag.vector_stores import LocalMilvusStore
 
-The evidence excerpts remain inspectable source text. Retrieval, extraction
-quality, and any generated contextual framing remain separate concerns.
+run_dir = "data/index/baseline"
+sparse = HungarianBM25Provider(stats_path=f"{run_dir}/bm25_hu_stats.json")
+dense = Qwen3EmbeddingProvider(device="cuda")
+store = LocalMilvusStore(
+    db_path=f"{run_dir}/milvus.db",
+    dense_dim=dense.get_dimension(),  # 1024, not the repo default of 384
+)
+index = VerbatimIndex(vector_store=store, dense_provider=dense, sparse_provider=sparse)
+
+question = "Mi a tagállamok kötelezettsége a jelentéstétel során?"
+hits = index.query(question, k=100, hybrid_weights={"dense": 0.5, "sparse": 0.5}, rrf_k=60)
+# the model runs remote code, so pin the revision (the one the demo uses)
+reranker = JinaV3Reranker(rerank_k=100, revision="e8a93f33f0b22108f8c2364f8484ce3422552fbc")
+hits = reranker.rerank(question, hits)
+
+extractor = CrossEncoderSentenceExtractor(threshold=0.5)
+spans = extractor.extract_spans(question, hits[:5])   # {chunk text: [verbatim sentences]}
+```
+
+An empty `spans` (or empty span lists) is an abstention: the demo shows a fixed
+Hungarian message in that case.
+
+## Environment setup
+
+No API key is needed for the default pipeline. All models run locally and the
+answer text comes from a static template.
+
+| Variable | Needed for |
+|---|---|
+| `DEEPSEEK_API_KEY` | Optional. The demo's opt-in `llm` extractor (`LLMSpanExtractor`, default `deepseek-v4-flash` at `https://api.deepseek.com/v1`; override with `--llm-model`, `--api-base`, `--llm-key-env`). The demo never reads `OPENAI_API_KEY` |
+| `OPENAI_API_KEY` | Optional. `run_extraction --extractor llm` reads the key from here and defaults to `gpt-4o-mini` at `https://api.openai.com/v1`; for DeepSeek pass `--llm-model deepseek-v4-flash --api-base https://api.deepseek.com/v1` |
+
+Practical notes:
+
+- **CPU and GPU.** The runners default to `--device cpu` with batch size 16. The demo
+  picks `cuda` when available and falls back to `cpu`, with batch size 32 on a GPU and
+  16 on CPU (`--device`, `--batch-size`, `--ce-batch-size` override). Batch sizes only
+  trade speed for memory. `--rerank-block-tokens 4096` fits a 16 GB card and is the
+  value to keep on CPU too: it changes the ranking, so other values are not comparable
+  to the baseline. The Jina reranker scores all candidates in one forward pass with
+  quadratic attention memory, so 100 chunks without blocking (about 12k tokens)
+  runs out of memory on a 16 GB card, which is what the blocking is for.
+- **Pinned dependencies.** `transformers==4.53.3` (the Jina remote code breaks on
+  newer aliases such as `dtype`), `milvus-lite<3` and `setuptools<81` (see the
+  comments in [pyproject.toml](pyproject.toml)).
+- **Licences.** The Jina reranker is CC-BY-NC-4.0 and the eval data is CC BY-NC-ND 4.0.
+  Both make this fork a non-commercial research setup. The code is MIT.
+
+## How it works
+
+1. **Eval corpus indexing.** Each corpus row is one chunk keyed by `chunk_id`
+   (`DocumentProcessor` chunking is bypassed so gold ids line up). BM25 statistics
+   are fitted on exactly these chunk texts, then dense and sparse vectors are
+   stored in Milvus Lite.
+2. **Retrieval.** The question is embedded densely (Qwen3, with its query prompt)
+   and sparsely (BM25 query vector). Milvus fuses both rankings with weighted
+   reciprocal rank fusion (dense 0.5, sparse 0.5, k=60). The top 100 go on.
+3. **Reranking.** Jina v3.5 reorders the fused top 100; the top 5 chunks go to
+   extraction.
+4. **Extraction.** HuSpaCy splits each chunk into sentences, the cross-encoder
+   scores each (question, sentence) pair, and sentences at or above the threshold
+   (0.5 by default) are kept. Spans are returned in relevance order
+   (best chunk first, best sentence first within a chunk).
+5. **Verbatim check** (demo and eval runner). Every emitted span must be an exact
+   substring of its source chunk. A failure is logged and the span is dropped, never
+   shown.
+6. **Answer** (demo). A static template fills in the spans. With no spans the answer is a
+   fixed Hungarian abstention message. Citations point at document and offsets.
+
+The guarantee is about provenance: the text is the source's text. It does not cover
+retrieval misses, a wrong sentence being picked, or the source being wrong. The
+extractor's job is to pick well; abstention is currently the weak spot (see
+[Results](#results-on-the-test-split)).
 
 ## Architecture
 
-### Core Components
-
-- **VerbatimRAG** (`verbatim_rag/core.py`): Main orchestrator that coordinates document retrieval, span extraction, and response generation
-- **VerbatimIndex** (`verbatim_rag/index.py`): Vector-based document indexing and retrieval
-- **SpanExtractor** (`verbatim_rag/extractors.py`): Abstract interface for extracting relevant text spans from documents
-  - **LLMSpanExtractor**: Uses OpenAI models to identify relevant spans
-  - **ModelSpanExtractor**: Uses fine-tuned BERT-based models for span classification
-- **DocumentProcessor** (`verbatim_rag/ingestion/`): Docling + Chonkie integration for intelligent document processing
-- **Document** (`verbatim_rag/document.py`): Core document representation with metadata
-
-### Data Flow
-1. Documents are processed and chunked using docling and chonkie
-2. Documents are indexed using vector embeddings
-3. User queries retrieve relevant documents
-4. Span extractors identify verbatim passages that answer the question
-5. Response templates structure the final answer with citations
-6. Responses expose selected source text with document references; guarantee
-   details depend on the extractor and template mode described above
-
-## API and web prototype
-
-The repository contains a FastAPI API and Vite/React development UI. They are
-not included in the PyPI wheel and are not yet part of the same compatibility
-gate as `verbatim-core`. The Compose stack below runs both locally
-([#27](https://github.com/KRLabsOrg/verbatim-rag/issues/27)); the document
-lifecycle contract is tracked in
-[#31](https://github.com/KRLabsOrg/verbatim-rag/issues/31).
-
-## Local development stack (Docker Compose)
-
-Docker Compose runs the API and the web UI together as a **development and demo
-stack**. It is meant for local work and evaluation; it is not a production
-deployment (no TLS, authentication, tenancy, or scaling).
-
-### Prerequisites
-
-- [Docker](https://docs.docker.com/get-docker/) with Docker Compose v2.24+
-  (the stack uses the optional `env_file` syntax)
-- An OpenAI-compatible API key (Groq by default, see `api/dependencies.py`)
-
-### Build and start
-
-```bash
-# 1. Create configuration from the example
-cp .env.example .env
-
-# 2. Edit .env and set your API key
-#    OPENAI_API_KEY=your_api_key_here
-
-# 3. Build the images and start the stack
-docker compose up --build
-
-# 4. Open http://localhost:8080 in your browser
-```
-
-Add `-d` to run detached. The first start downloads the embedding model from
-HuggingFace, so it needs network access and can take several minutes; the API
-health check covers that with a startup grace period (`start_period` in
-`docker-compose.yml` — raise it on a slow connection), and the frontend waits
-for the API to report healthy.
-
-The API key is not validated at startup: a missing or empty `OPENAI_API_KEY`
-still brings the stack up healthy and surfaces as an error on the first query.
-
-### Logs and status
-
-```bash
-docker compose ps                  # service and health-check state
-docker compose logs -f             # follow all services
-docker compose logs -f api         # follow one service
-```
-
-The API health check polls `/api/status`, which fails visibly when a required
-dependency or configuration is unavailable — a stuck `starting` state in
-`docker compose ps` means the API could not initialise, and `docker compose
-logs api` shows why.
-
-### Stop and persistence
-
-The Milvus Lite database lives in a Docker volume named `milvus_data`, so the
-index survives restarts:
-
-```bash
-docker compose down          # stop containers, keep data
-docker compose down -v       # also remove the database volume
-```
-
-### Secret handling
-
-No key is baked into the image: `OPENAI_API_KEY` is passed at run time only.
-Keep it in `.env`, which is git-ignored and excluded from the build context via
-`.dockerignore`, or pass it inline for a single run:
-
-```bash
-OPENAI_API_KEY=your_key_here docker compose up --build
-```
-
-### Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | (required) | OpenAI-compatible API key |
-| `INDEX_PATH` | `/data/index.db` | Milvus Lite database path in the container |
-| `FRONTEND_PORT` | `8080` | Host port the frontend is published on |
-
-All of these can be set in `.env` (copy `.env.example`) or exported in the
-shell. CORS configuration is not needed: the browser only talks to nginx, which
-proxies `/api/` to the backend same-origin (the Vite dev server does the same
-via its own proxy).
-
-### Architecture
-
 ```mermaid
 graph LR
-    A[Browser] -->|http://localhost:8080| B[nginx :80]
-    B -->|/api/*| C[FastAPI :8000]
-    C --> D[(Milvus Lite<br>/data/index.db)]
+    Q[Question] --> S[Hungarian BM25<br>HuSpaCy lemmas]
+    Q --> D[Qwen3-Embedding-0.6B]
+    S --> F[Milvus Lite<br>weighted RRF, top 100]
+    D --> F
+    F --> R[Jina v3.5 reranker]
+    R -->|top 5| X[HuSpaCy sentence split<br>+ bge-reranker-v2-m3]
+    X --> V[Verbatim assertion]
+    V --> T[Static Hungarian template<br>+ citations]
 ```
 
-- **nginx** serves the React SPA and proxies `/api/` requests to the backend
-- **FastAPI** handles all API requests using the Verbatim RAG pipeline
-- **Milvus Lite** stores the vector index in a persistent Docker volume
+The structure is upstream's (`VerbatimRAG.query`: index query, optional reranker,
+span extractor, template manager, response builder). Components plug in through
+`DenseEmbeddingProvider`, `SparseEmbeddingProvider`, `BaseReranker` and
+`SpanExtractor`. `verbatim_rag` is layered on `verbatim_core`; several of its
+modules are thin re-exports, so new extractor logic goes in the core class
+hierarchy or a subclass.
 
-The frontend is served as a static Vite build and calls the API through relative
-`/api/` paths, which nginx proxies to the `api` service over the Compose
-network. No host address is baked into the bundle, so changing `FRONTEND_PORT`
-or serving the stack from another host needs no rebuild.
+### Hungarian-specific decisions
 
-### Container dependency lock
+**One HuSpaCy pipeline for all text analysis.** `hu_core_news_lg` with parser and
+NER disabled provides lemmas for BM25 and sentence boundaries for extraction.
+Generic sentence splitters break on ordinals (`1990. évi`) and abbreviations
+(`kft.`, `stb.`), and each broken sentence becomes a broken answer. Known gap:
+compounds (`szerződés` vs `munkaszerződés`) are not matched by lemmatization.
 
-The image installs from `docker/constraints.txt`, a generated lock of one
-known-working environment. `pyproject.toml` keeps the library's broad supported
-ranges; the lock narrows them for the container only, so a resolution that
-breaks the stack cannot silently reach the image. The hand-maintained input and
-the regeneration command are documented in `docker/overrides.txt`; regenerate
-after changing dependencies in `pyproject.toml` or bumping `packages/core`.
+**BM25 is computed client-side.** Milvus Lite has no native BM25 and the store
+forces `enable_full_text=False`. `HungarianBM25Provider` splits the score so the
+inner product Milvus computes on `sparse_vector` equals it: document vectors hold
+the saturated, length-normalized term frequency (`embed_batch`) and query vectors
+hold IDF (`embed_text`). Invariants:
 
-## ModernBERT Span Extractor
+- `fit()` runs once before indexing, on exactly the chunk strings that get embedded.
+  The statistics persist to `bm25_hu_stats.json`; the embed methods raise if unfitted.
+- The same analysis (lowercased lemma, alphabetic or numeric tokens, stop words
+  dropped) runs at index and query time. A mismatch silently halves recall.
+- Term ids are `crc32(term) & 0x7FFFFFFF`, stable across processes. `hash()` is never used.
+- A query whose terms are all unseen yields an empty vector, and the caller drops
+  `sparse` from the hybrid weights for that query instead of sending `{}`.
 
-[KRLabsOrg/verbatim-rag-modern-bert-v2](https://huggingface.co/KRLabsOrg/verbatim-rag-modern-bert-v2) is a 150M-parameter query-conditioned token classifier built on `gte-reranker-modernbert-base`. It supports up to 8,192 tokens and is trained on scientific papers, Wikipedia QA, financial tables, medical literature, legal contracts, product manuals, and code/tool output.
+**Dense retrieval.** `Qwen3EmbeddingProvider` applies the model's `query` prompt in
+`embed_text` only (documents are embedded without it) and has dimension 1024. A
+Milvus collection's schema is fixed at creation, so a different model needs a new
+db file, never an existing index.
 
-The linked model card reports higher micro Word-F1 than the evaluated Zilliz
-Semantic Highlight and Provence baselines on ACL, RAGBench, Squeez, and QASPER
-slices. These are extractor evaluations, not end-to-end hallucination rates.
+**Reranking.** `JinaV3Reranker` is a 0.6B listwise reranker. Its scores are only
+comparable within one call, so it orders candidates but cannot judge sentences or
+abstain. `max_block_tokens` splits the candidates into blocks scored against one
+shared query embedding to bound memory; rankings differ from a single pass, so runs
+with different values are not directly comparable. The tail past `rerank_k` keeps
+its retrieval order, and the model revision can be pinned with `--rerank-revision`
+(the demo pins `e8a93f33f0b2`).
 
-`ModelSpanExtractor` defaults to this model:
+**Sentence-level extraction.** `CrossEncoderSentenceExtractor` scores each sentence
+independently with `BAAI/bge-reranker-v2-m3` (multilingual, Apache-2.0) through a
+sigmoid, so scores lie in [0, 1] and a fixed threshold is meaningful. Model errors
+and non-finite scores raise; they are never read as abstention.
+`LLMSpanExtractor` (any OpenAI-compatible endpoint) is the quality ceiling, and an
+overlap extractor (question and sentence word overlap, no model) is the floor.
 
-```python
-from verbatim_rag.core import VerbatimRAG
-from verbatim_rag.index import VerbatimIndex
-from verbatim_rag.extractors import ModelSpanExtractor
-from verbatim_rag.vector_stores import LocalMilvusStore
-from verbatim_rag.embedding_providers import SpladeProvider
+**Static template and verbatim assertion.** The default `contextual` template mode
+lets an LLM write framing text; the demo uses a static template with a Hungarian
+filler and a fixed Hungarian abstention message. The verbatim assertion (span is an
+exact substring of its chunk) is checked in `run_extraction` and in the demo. Neither
+the Hungarian template nor the assertion is part of `VerbatimRAG.query` itself, whose
+defaults are unchanged: pass `template_mode="static"` when using it directly.
 
-extractor = ModelSpanExtractor(
-    model_path="KRLabsOrg/verbatim-rag-modern-bert-v2",  # default
-    threshold=0.2,
-    min_span_chars=30,
-    merge_gap_chars=20,
-    device=None,  # auto-detects cuda, mps, cpu
-)
+### Results on the test split
 
-sparse_provider = SpladeProvider(
-    model_name="opensearch-project/opensearch-neural-sparse-encoding-doc-v2-distill",
-    device="cpu"
-)
-vector_store = LocalMilvusStore(
-    db_path="./index.db",
-    collection_name="verbatim_rag",
-    enable_dense=False,
-    enable_sparse=True,
-)
-index = VerbatimIndex(vector_store=vector_store, sparse_provider=sparse_provider)
+Baseline retrieval (`evaluation/hu_legal/runs/baseline.json`, the 880 answerable test queries):
 
-rag_system = VerbatimRAG(
-    index=index,
-    extractor=extractor,
-    template_mode="static",  # no generated contextual framing
-    k=5,
-)
-response = rag_system.query("Main findings of the paper?")
-print(response.answer)
+| | Sparse | Dense | Fused | Fused + Jina rerank |
+|---|---|---|---|---|
+| Recall@10 | 0.735 | 0.739 | 0.782 | 0.884 |
+| MRR | 0.583 | 0.588 | 0.624 | 0.749 |
+
+Fused Recall@100 is 0.908. Extraction runs over all 1,005 test queries (880
+answerable, 125 unanswerable). With the cross-encoder at threshold 0.5 over the
+reranked top 5: verbatim pass rate 1.0, chunk AUC 0.936, and 0.745 of queries
+with the gold chunk in context are answered. The judge ranks well, but its maximum
+score is a weak abstention signal (balanced accuracy about 0.67 at every threshold,
+the same as the LLM extractor), so unanswerable questions are often still answered.
+Run logs with full configs are in `evaluation/hu_legal/runs/`. Every change to
+tokenization, models, weights or thresholds is run against the full eval set and
+logged with its config.
+
+## Demo
+
+The demo serves the retrieved-mode pipeline above to the React UI. It has an
+eval-query picker, gold-chunk marks, and a verdict per query (answered from a gold
+chunk, correct abstention, retrieval miss, and so on).
+
+```bash
+# backend: reuses data/index/baseline/ when its index_meta.json matches the corpus
+python -m evaluation.hu_legal.demo --index-tag baseline
+# add --build to build the index if none is complete
+
+# optional LLM extractor next to the cross-encoder (a UI toggle)
+DEEPSEEK_API_KEY=... python -m evaluation.hu_legal.demo --index-tag baseline --extractors crossencoder,llm
+
+# frontend
+cd frontend && npm install && npm run dev       # http://localhost:3000, proxies /api to :8000
 ```
 
-### Datasets
+Things to know:
 
-| Resource | Link |
-|---|---|
-| 114K ACL Anthology papers in structured Markdown | [KRLabsOrg/acl-anthology-md](https://huggingface.co/datasets/KRLabsOrg/acl-anthology-md) |
-| Approximately 195K silver-labelled canonical query-chunk rows | [KRLabsOrg/verbatim-spans](https://huggingface.co/datasets/KRLabsOrg/verbatim-spans) |
-| Human-annotated ACL extraction benchmark | [KRLabsOrg/acl-verbatim-spans](https://huggingface.co/datasets/KRLabsOrg/acl-verbatim-spans) |
-| Training and evaluation pipeline | [KRLabsOrg/acl-verbatim](https://github.com/KRLabsOrg/acl-verbatim) |
+- Every query runs the measured configuration: request-side `k` and weights are
+  ignored. Queries are served one at a time.
+- Reranker errors and lost LLM calls show as errors, never as abstentions.
+- The demo has its own FastAPI app in `evaluation/hu_legal/demo.py`, not `api/app.py`.
 
-## Citation
+## Dataset
 
-If you use Verbatim RAG or the extractive models in your research, please cite our papers:
+The eval set is built from the Hungarian slice of the
+[JudicialMind Legal Training Dataset](https://huggingface.co/datasets/judicialmind/legal-training-dataset)
+(`hungarian/eu/{eurlex_hu,lemur_hu}_{A,B,C}.parquet`): 10,023 query-passage pairs
+from 10 EU documents, licensed CC BY-NC-ND 4.0. `data/` and `annotations/` are
+gitignored for that reason; check the licence before sharing derived data.
+
+```bash
+python -m evaluation.hu_legal.build_eval_set                      # current dataset revision
+python -m evaluation.hu_legal.build_eval_set --revision <hf-sha> --seed N
+```
+
+The build is deterministic for a given revision and seed. It produces `corpus.jsonl`
+(8,820 chunks), `queries.jsonl` (test 1,005, dev 1,005, train 8,033), an annotation
+template of 100 test queries for hand-labelled gold spans, and `manifest.json`.
+
+Design choices worth knowing:
+
+- Buckets A/B/C are passage lengths (up to 256, 512 and 1,024 tokens), not splits.
+  Splits are drawn separately, stratified by answerability, source, bucket,
+  difficulty and query type.
+- `gold_chunk_ids` include overlapping chunks, so retrieving a superset chunk counts.
+- Unanswerable queries (about 12% per split) are made by removing whole clusters of
+  overlapping chunks from the corpus, plus 20 hand-written out-of-scope questions.
+- Queries are synthetic and some do not match their passage. Word-level F1 needs
+  the annotation pass (`gold_spans`) and reports `n_gold=0` until it is merged.
+
+Metrics are reported per method and split by `query_type`, `legal_domain` and
+`difficulty`: Recall and MRR (`run_retrieval`), and `run_extraction` for extraction,
+abstention and verbatim assertion metrics:
+
+```bash
+python -m evaluation.hu_legal.run_retrieval --split test --tag NAME --device cuda --rerank --rerank-block-tokens 4096
+python -m evaluation.hu_legal.run_extraction --mode oracle --split dev --distractors 2
+python -m evaluation.hu_legal.run_extraction --mode retrieved --index-tag baseline --device cuda --rerank --rerank-block-tokens 4096
+```
+
+Both runners default to `--device cpu`, and `--rerank` without `--rerank-block-tokens`
+scores all candidates in one pass.
+
+Full details, including the annotation workflow and caveats, are in the
+[eval set README](evaluation/hu_legal/README.md).
+
+## Contributing and licence
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md). Changes to
+span validation, citations, templates, schemas or defaults need an explanation.
+The code is MIT licensed ([LICENSE](LICENSE)); model and data licences are noted
+above.
+
+## Upstream and citation
+
+This fork builds on [VerbatimRAG](https://github.com/KRLabsOrg/verbatim-rag) by KR
+Labs ([paper](https://arxiv.org/abs/2605.21102),
+[models](https://huggingface.co/collections/KRLabsOrg/verbatim-rag-v1)). If you use
+the approach in research, please cite the upstream work:
 
 ```bibtex
 @misc{Recski:2026,
@@ -382,8 +359,6 @@ If you use Verbatim RAG or the extractive models in your research, please cite o
     author = "Kovacs, Adam  and
       Schmitt, Paul  and
       Recski, Gabor",
-    editor = "Soni, Sarvesh  and
-      Demner-Fushman, Dina",
     booktitle = "Proceedings of the 24th Workshop on Biomedical Language Processing (Shared Tasks)",
     month = aug,
     year = "2025",
@@ -391,7 +366,5 @@ If you use Verbatim RAG or the extractive models in your research, please cite o
     publisher = "Association for Computational Linguistics",
     url = "https://aclanthology.org/2025.bionlp-share.8/",
     pages = "69--74",
-    ISBN = "979-8-89176-276-3",
-    abstract = "We present a lightweight, domain{-}agnostic verbatim pipeline for evidence{-}grounded question answering. Our pipeline operates in two steps: first, a sentence-level extractor flags relevant note sentences using either zero-shot LLM prompts or supervised ModernBERT classifiers. Next, an LLM drafts a question-specific template, which is filled verbatim with sentences from the extraction step. This prevents hallucinations and ensures traceability. In the ArchEHR{-}QA 2025 shared task, our system scored 42.01{\%}, ranking top{-}10 in core metrics and outperforming the organiser{'}s 70B{-}parameter Llama{-}3.3 baseline. We publicly release our code and inference scripts under an MIT license."
 }
 ```
