@@ -48,7 +48,7 @@ python -m evaluation.hu_legal.run_retrieval [--split test] [--limit N] [--skip-d
 # Extraction eval (oracle = gold passage only, optional hard distractors; retrieved = full pipeline). Do not run without being asked
 python -m evaluation.hu_legal.run_extraction --mode oracle|retrieved [--extractor crossencoder|llm|overlap] [--split dev] [--distractors 2] [--thresholds 0.3,0.5,0.7,0.9] [--index-tag NAME] [--rerank]
 
-# Demo of the pipeline on the eval set (defaults: --device cuda --batch-size 32 --rerank-block-tokens 4096; binds 127.0.0.1:8000)
+# Demo of the pipeline on the eval set (defaults: --device auto = cuda if available else cpu, batch sizes 32 on GPU / 16 on cpu, --rerank-block-tokens 4096; binds 127.0.0.1:8000. The logged baselines used batch sizes 64 / 32, so a rerun may differ by float noise)
 python -m evaluation.hu_legal.demo --index-tag baseline [--build] [--extractors crossencoder,llm]   # llm needs DEEPSEEK_API_KEY
 cd frontend && npm install && npm run dev    # http://localhost:3000, proxies /api to :8000
 

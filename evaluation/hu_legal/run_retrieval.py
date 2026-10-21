@@ -275,7 +275,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--sparse-weight", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=0, help="Seed for the --limit sample")
     p.add_argument("--rrf-k", type=int, default=60)
-    p.add_argument("--batch-size", type=int, default=64, help="Indexing/embedding batch size")
+    p.add_argument("--batch-size", type=int, default=16, help="Indexing/embedding batch size")
     p.add_argument("--tag", help="Name for this run; also names the index dir under data/")
     p.add_argument(
         "--overwrite",

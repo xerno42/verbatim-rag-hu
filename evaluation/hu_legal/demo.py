@@ -9,7 +9,9 @@ Local demo of the Hungarian pipeline on the eval set, served to the React UI in 
 The pipeline is the one `run_extraction --mode retrieved --rerank` measures: fused Hungarian
 BM25 + Qwen3 retrieval of --retrieve-k chunks, Jina v3.5 rerank, extraction on the top
 --extract-k chunks, and a static Hungarian template (no LLM writes framing text). Defaults
-fit a 16 GB GPU (--device cuda --batch-size 32 --rerank-block-tokens 4096).
+fit a 16 GB GPU (--device cuda --batch-size 32 --rerank-block-tokens 4096). Without a GPU the
+device falls back to cpu and the batch sizes to 16; the rerank block size stays 4096, since
+rankings depend on it.
 
 Each request picks one of the loaded extractors (the UI has a toggle):
 
@@ -97,6 +99,9 @@ _TAG_RE = re.compile(r"[\w.-]+")
 # app queues requests; this one also covers a worker thread that outlives its request: a
 # client disconnect cancels the stream, but not the asyncio.to_thread extraction call.
 MODEL_LOCK = threading.Lock()
+# Embedding and cross-encoder batch sizes (resolve_device_defaults).
+GPU_BATCH_SIZE = 32
+CPU_BATCH_SIZE = 16
 # openai's default is 600 s with 2 retries; a hung call would hold MODEL_LOCK that long.
 LLM_TIMEOUT_S = 60
 LLM_MAX_RETRIES = 1
@@ -463,6 +468,24 @@ def is_loopback(host: str) -> bool:
         return host == "localhost"
 
 
+def _default_batch_size(device: str) -> int:
+    return GPU_BATCH_SIZE if device.startswith("cuda") else CPU_BATCH_SIZE
+
+
+def resolve_device_defaults(args) -> None:
+    """Resolve --device auto and the batch sizes left unset, in place. Without a GPU the
+    batches shrink: they only trade speed for memory, and on cpu they share RAM with the
+    three models."""
+    if args.device == "auto":
+        import torch
+
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.batch_size is None:
+        args.batch_size = _default_batch_size(args.device)
+    if args.ce_batch_size is None:
+        args.ce_batch_size = _default_batch_size(args.ce_device or args.device)
+
+
 def parse_extractors(value: str) -> List[str]:
     names = [v.strip() for v in value.split(",") if v.strip()]
     unknown = [n for n in names if n not in EXTRACTORS]
@@ -496,8 +519,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--split", choices=["test", "dev", "train"], default="test")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--device", default="cuda", help="Device for the dense model and reranker")
-    p.add_argument("--batch-size", type=int, default=32, help="Embedding batch size")
+    p.add_argument(
+        "--device",
+        default="auto",
+        help="Device for the dense model and reranker (auto: cuda if available, else cpu)",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        help=f"Embedding batch size (default: {GPU_BATCH_SIZE} on cuda, {CPU_BATCH_SIZE} on cpu)",
+    )
     g = p.add_argument_group("extractors")
     g.add_argument(
         "--extractors",
@@ -510,7 +541,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument("--ce-model", default="BAAI/bge-reranker-v2-m3")
     g.add_argument("--ce-revision", help="HF commit sha to pin the cross-encoder checkpoint")
     g.add_argument("--ce-device", help="Default: --device")
-    g.add_argument("--ce-batch-size", type=int, default=32)
+    g.add_argument(
+        "--ce-batch-size",
+        type=int,
+        help=f"Pairs per forward pass (default: {GPU_BATCH_SIZE} on cuda, {CPU_BATCH_SIZE} on cpu)",
+    )
     g.add_argument("--ce-max-length", type=int, default=512)
     g.add_argument("--ce-threshold", type=float, default=0.5)
     g.add_argument("--llm-model", default="deepseek-v4-flash")
@@ -533,9 +568,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--rerank-block-tokens",
         type=int,
         default=4096,
-        help="Approximate cap on tokens per reranker forward pass (4096 fits a 16 GB GPU)",
+        help="Approximate cap on tokens per reranker forward pass (4096 fits a 16 GB GPU and is "
+        "kept on cpu: the ranking depends on it, so other values are not comparable to the baseline)",
     )
     args = p.parse_args(argv)
+    resolve_device_defaults(args)
     if args.extract_k < 1 or args.retrieve_k < args.extract_k:
         p.error("need 1 <= --extract-k <= --retrieve-k")
     if not 0.0 <= args.ce_threshold <= 1.0:

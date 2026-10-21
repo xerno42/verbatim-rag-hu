@@ -537,7 +537,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument("--ce-model", default="BAAI/bge-reranker-v2-m3")
     g.add_argument("--ce-revision", help="HF commit sha to pin the cross-encoder checkpoint")
     g.add_argument("--ce-device", help="cuda / mps / cpu (default: sentence-transformers picks)")
-    g.add_argument("--ce-batch-size", type=int, default=32)
+    g.add_argument("--ce-batch-size", type=int, default=16)
     g.add_argument(
         "--ce-max-length", type=int, default=512, help="Token budget per (question, sentence)"
     )
@@ -590,7 +590,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument("--dense-weight", type=float, default=0.5)
     g.add_argument("--sparse-weight", type=float, default=0.5)
     g.add_argument("--rrf-k", type=int, default=60)
-    g.add_argument("--batch-size", type=int, default=64, help="Indexing/embedding batch size")
+    g.add_argument("--batch-size", type=int, default=16, help="Indexing/embedding batch size")
     args = p.parse_args(argv)
     retrieved = args.mode == "retrieved"
     if retrieved and args.skip_dense and args.skip_sparse:

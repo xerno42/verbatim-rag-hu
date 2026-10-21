@@ -112,8 +112,10 @@ cd frontend && npm install && npm run dev                            # http://lo
 `demo.py` serves the retrieved-mode pipeline to the React UI in `frontend/`, with an eval-query
 picker, gold-chunk marks and a verdict per query (answered from a gold chunk, correct abstention,
 retrieval miss, and so on). The pipeline is fused retrieval of the top 100, the Jina v3.5 rerank,
-extraction on the top 5, and a static Hungarian template, so no LLM writes text. The defaults fit
-a 16 GB GPU: `--device cuda --batch-size 32 --rerank-block-tokens 4096`.
+extraction on the top 5, and a static Hungarian template, so no LLM writes text. `--device`
+defaults to `auto` (cuda if available, else cpu) with batch size 32 on a GPU and 16 on cpu. The
+default `--rerank-block-tokens 4096` fits a 16 GB GPU and stays on cpu, since the ranking
+depends on it.
 
 The extractor can be switched per query in the UI:
 - `crossencoder` is the default, at `--ce-threshold 0.5`.

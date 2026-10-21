@@ -11,6 +11,8 @@ import pytest
 
 from evaluation.hu_legal.demo import (
     ABSTAIN_HU,
+    CPU_BATCH_SIZE,
+    GPU_BATCH_SIZE,
     TEMPLATE_HU,
     CheckedExtractor,
     HungarianStaticTemplate,
@@ -22,6 +24,7 @@ from evaluation.hu_legal.demo import (
     parse_extractors,
     prepare_index_dir,
     query_view,
+    resolve_device_defaults,
 )
 from evaluation.hu_legal.run_retrieval import INDEX_META, index_meta, write_index_meta
 
@@ -339,3 +342,38 @@ class TestApp:
             == 400
         )
         assert client.post("/api/query/stream", json={"question": "  "}).status_code == 400
+
+
+class TestResolveDeviceDefaults:
+    def args(self, **kw):
+        return SimpleNamespace(
+            **{"device": "cpu", "ce_device": None, "batch_size": None, "ce_batch_size": None, **kw}
+        )
+
+    def test_cpu_gets_small_batches(self):
+        a = self.args()
+        resolve_device_defaults(a)
+        assert (a.device, a.batch_size, a.ce_batch_size) == ("cpu", CPU_BATCH_SIZE, CPU_BATCH_SIZE)
+
+    def test_cuda_gets_gpu_batches(self):
+        a = self.args(device="cuda:1")
+        resolve_device_defaults(a)
+        assert (a.batch_size, a.ce_batch_size) == (GPU_BATCH_SIZE, GPU_BATCH_SIZE)
+
+    def test_cross_encoder_batch_follows_its_own_device(self):
+        a = self.args(ce_device="cuda")
+        resolve_device_defaults(a)
+        assert (a.batch_size, a.ce_batch_size) == (CPU_BATCH_SIZE, GPU_BATCH_SIZE)
+
+    def test_explicit_values_are_kept(self):
+        a = self.args(batch_size=3, ce_batch_size=5)
+        resolve_device_defaults(a)
+        assert (a.batch_size, a.ce_batch_size) == (3, 5)
+
+    @pytest.mark.parametrize("available, expected", [(True, "cuda"), (False, "cpu")])
+    def test_auto_follows_cuda_availability(self, monkeypatch, available, expected):
+        torch = pytest.importorskip("torch")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+        a = self.args(device="auto")
+        resolve_device_defaults(a)
+        assert a.device == expected
