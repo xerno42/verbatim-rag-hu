@@ -17,7 +17,10 @@ logit, as relevance rerankers like bge do; a head that already outputs a probabi
 squashed into [0.5, 0.73]. Non-finite scores raise instead of reading as abstention.
 
 Every emitted span is a slice of the chunk text at HuSpaCy sentence offsets, so it is an
-exact substring of its source chunk by construction.
+exact substring of its source chunk by construction. The offsets are repaired by
+`hungarian_sentences.repair_offsets` (enumerators such as "(3)" are attached to the sentence
+they introduce, breaks after "vtsz."-style abbreviations are undone) unless
+`repair_sentences=False`.
 
 The scores are not calibrated for this task; tune `threshold` on the dev split.
 """
@@ -27,6 +30,8 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from verbatim_core.extractors import SpanExtractor
+
+from verbatim_rag.hungarian_sentences import repair_offsets
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,7 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
         spacy_model: str = "hu_core_news_lg",
         nlp: Optional[Any] = None,
         spacy_batch_size: int = 64,
+        repair_sentences: bool = True,
     ):
         """
         Args:
@@ -58,6 +64,7 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
             nlp: Preloaded spaCy pipeline (overrides `spacy_model`), e.g. the one
                 HungarianBM25Provider already holds.
             spacy_batch_size: nlp.pipe batch size.
+            repair_sentences: Repair HuSpaCy sentence boundaries (see the module docstring).
         """
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"threshold must be in [0, 1], got {threshold}")
@@ -76,6 +83,7 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
             raise ValueError(f"spaCy pipeline has no sentence boundaries: {nlp.pipe_names}")
         self.nlp = nlp
         self.spacy_batch_size = spacy_batch_size
+        self.repair_sentences = repair_sentences
 
         self.model_name = model
         self.revision = revision
@@ -99,8 +107,9 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
     # ---- sentences ----------------------------------------------------------
 
     @staticmethod
-    def _sentence_offsets(text: str, doc) -> List[Tuple[int, int]]:
-        """(start, end) of each sentence with surrounding whitespace trimmed."""
+    def _sentence_offsets(text: str, doc, repair: bool = True) -> List[Tuple[int, int]]:
+        """(start, end) of each sentence with surrounding whitespace trimmed, repaired by
+        `repair_offsets` when `repair` is set."""
         offsets = []
         for sent in doc.sents:
             start, end = sent.start_char, sent.end_char
@@ -110,7 +119,7 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
                 end -= 1
             if start < end:
                 offsets.append((start, end))
-        return offsets
+        return repair_offsets(text, offsets) if repair else offsets
 
     # ---- scoring ------------------------------------------------------------
 
@@ -124,7 +133,8 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
 
         sentences: List[Tuple[str, str]] = []
         for text, doc in zip(todo, self.nlp.pipe(todo, batch_size=self.spacy_batch_size)):
-            sentences += [(text, text[s:e]) for s, e in self._sentence_offsets(text, doc)]
+            offsets = self._sentence_offsets(text, doc, self.repair_sentences)
+            sentences += [(text, text[s:e]) for s, e in offsets]
         if not sentences:
             return scores
 

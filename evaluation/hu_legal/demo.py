@@ -344,6 +344,7 @@ def make_extractors(args, nlp) -> Dict[str, SpanExtractor]:
                 batch_size=args.ce_batch_size,
                 max_length=args.ce_max_length,
                 nlp=nlp,
+                repair_sentences=not args.no_sentence_repair,
             )
         else:
             from verbatim_core.extractors import LLMSpanExtractor
@@ -505,7 +506,11 @@ def demo_info(args, n_queries: int) -> Dict[str, Any]:
         "rerank_model": args.rerank_model,
     }
     if "crossencoder" in args.extractors:
-        info["crossencoder"] = {"model": args.ce_model, "threshold": args.ce_threshold}
+        info["crossencoder"] = {
+            "model": args.ce_model,
+            "threshold": args.ce_threshold,
+            "sentence_repair": not args.no_sentence_repair,
+        }
     if "llm" in args.extractors:
         info["llm"] = {"model": args.llm_model}
     return info
@@ -548,6 +553,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     g.add_argument("--ce-max-length", type=int, default=512)
     g.add_argument("--ce-threshold", type=float, default=0.5)
+    g.add_argument(
+        "--no-sentence-repair",
+        action="store_true",
+        help="Raw HuSpaCy sentences, without verbatim_rag.hungarian_sentences",
+    )
     g.add_argument("--llm-model", default="deepseek-v4-flash")
     g.add_argument("--api-base", default="https://api.deepseek.com/v1")
     g.add_argument("--llm-key-env", default="DEEPSEEK_API_KEY", help="Env var holding the key")

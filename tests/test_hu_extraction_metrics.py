@@ -1,5 +1,6 @@
 """Metric helpers of the Hungarian extraction eval runner (network-free)."""
 
+import argparse
 import json
 import logging
 from types import SimpleNamespace
@@ -7,13 +8,16 @@ from types import SimpleNamespace
 import pytest
 
 from evaluation.hu_legal.run_extraction import (
+    SWEEP_GRID,
     LogCounter,
+    abstention_sweep,
     breakdown,
     check_index_meta,
     chunk_auc_pairs,
     covered_chars,
     distractor_pools,
     oracle_results,
+    parse_rate,
     parse_thresholds,
     predict,
     sample_distractors,
@@ -163,6 +167,72 @@ class TestSummarize:
         b = breakdown(rows, "s", "oracle", "query_type")
         assert b["a"]["answer_rate"] == 1.0
         assert b["b"]["answer_rate"] == 0.0
+
+
+def _scored(answerable, max_score):
+    return {"answerable": answerable, "max_score": max_score}
+
+
+class TestAbstentionSweep:
+    def _row_at(self, sweep, t):
+        return next(row for row in sweep["table"] if row["t"] == t)
+
+    def test_grid(self):
+        assert SWEEP_GRID[0] == 0.0 and SWEEP_GRID[-1] == 1.0 and len(SWEEP_GRID) == 21
+
+    def test_suggests_most_correct_abstention_within_the_cap(self):
+        rows = [_scored(True, s) for s in (0.9, 0.8, 0.62, 0.35)]
+        rows += [_scored(False, s) for s in (0.2, 0.3, 0.6)]
+        sweep = abstention_sweep(rows, 0.25, grid=[0.0, 0.25, 0.4, 0.65])
+        assert sweep["suggested"]["t"] == 0.4  # 0.65 would also abstain on 0.62 (false 0.5)
+        assert sweep["suggested"]["false_abstention"] == 0.25
+        assert sweep["suggested"]["correct_abstention"] == pytest.approx(2 / 3)
+        assert (sweep["n_answerable"], sweep["n_unanswerable"]) == (4, 3)
+
+    def test_ties_pick_the_lowest_threshold(self):
+        rows = [_scored(True, 0.9), _scored(False, 0.1)]
+        sweep = abstention_sweep(rows, 0.0, grid=[0.0, 0.3, 0.5, 0.95])
+        assert sweep["suggested"]["t"] == 0.3
+
+    def test_zero_is_always_answer(self):
+        rows = [_scored(True, 0.0), _scored(False, 0.4), _scored(False, 0.0)]
+        row = self._row_at(abstention_sweep(rows, 0.1), 0.0)
+        assert row["false_abstention"] == 0.0
+        assert row["correct_abstention"] == 0.0
+        assert row["abstention_accuracy"] == pytest.approx(1 / 3)
+        assert row["balanced_accuracy"] == 0.5
+
+    def test_none_score_always_abstains(self):
+        rows = [_scored(True, None), _scored(False, None)]
+        row = self._row_at(abstention_sweep(rows, 1.0), 0.0)
+        assert row["false_abstention"] == 1.0 and row["correct_abstention"] == 1.0
+
+    def test_no_threshold_within_the_cap(self):
+        rows = [_scored(True, None), _scored(False, 0.5)]
+        assert abstention_sweep(rows, 0.1)["suggested"] is None
+
+    def test_no_unanswerable_queries(self):
+        sweep = abstention_sweep([_scored(True, 0.9)], 0.1)
+        assert sweep["suggested"] is None
+        assert sweep["table"][0]["balanced_accuracy"] is None
+
+    def test_matches_summarize_at_a_setting_threshold(self):
+        scores = [(True, 0.9), (True, 0.3), (True, None), (False, 0.6), (False, 0.1)]
+        rows = [
+            {**_row(a, int(m is not None and m >= 0.5), gold_in_context=True), "max_score": m}
+            for a, m in scores
+        ]
+        summary = summarize(rows, "s", "retrieved")
+        row = self._row_at(abstention_sweep(rows, 0.1), 0.5)
+        assert row["false_abstention"] == summary["false_abstention_rate"]
+        assert row["correct_abstention"] == 1 - summary["false_answer_rate"]
+        assert row["abstention_accuracy"] == pytest.approx(summary["abstention_accuracy"])
+
+    def test_parse_rate(self):
+        assert parse_rate("0.1") == 0.1
+        for bad in ("1.5", "-0.1", "nan"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                parse_rate(bad)
 
 
 class TestSettings:
@@ -363,3 +433,11 @@ class TestOverlapScorer:
         assert OverlapScorer.spans_from_scores(scores, 0.5) == {
             text: ["A felmondási idő harminc nap."]
         }
+
+    def test_make_extractor_passes_the_sentence_repair_flag(self):
+        pytest.importorskip("verbatim_rag.cross_encoder_extractor")
+        from evaluation.hu_legal.run_extraction import make_extractor
+
+        for flag in (False, True):
+            args = SimpleNamespace(extractor="overlap", no_sentence_repair=flag)
+            assert make_extractor(args, nlp=object()).repair_sentences is not flag

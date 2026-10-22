@@ -94,6 +94,19 @@ completed index there unless you pass `--overwrite`. Queries annotated `"no"` (`
 scored by either runner. With `--extractor llm`, failed API calls are reported as
 `extractor_errors` instead of being counted as abstentions.
 
+For crossencoder and overlap, retrieved mode also prints an abstention sweep. A query counts as
+answered at threshold t when its best sentence score is at least t, so thresholds from 0 to 1 in
+0.05 steps are scored from one pass: correct abstention (unanswerable queries left unanswered),
+false abstention, abstention accuracy and balanced accuracy. The suggested t abstains most on
+unanswerable queries while keeping false abstention within `--max-false-abstention` (default
+0.10). When no t qualifies, the run says so. Read the suggestion on dev only.
+
+Both scoring extractors split chunks into HuSpaCy sentences and then repair the boundaries
+(`verbatim_rag/hungarian_sentences.py`): a bare enumerator such as `(3)` or `c)` is attached to
+the sentence it introduces, and a break after `vtsz.`-style abbreviations is undone.
+`--no-sentence-repair` keeps the raw splits, for comparing the two. The run log records which
+was used (`sentence_repair`).
+
 Word-level F1 needs `gold_spans`, so it reports `n_gold=0` until the annotation pass above is
 merged. Until then, use `gold_answer_rate`, coverage, `distractor_answer_rate`, gold-chunk span
 precision and `chunk_auc`. Use the dev split

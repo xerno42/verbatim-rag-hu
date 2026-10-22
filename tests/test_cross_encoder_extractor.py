@@ -187,6 +187,26 @@ class TestScores:
         assert scores["Egy. Közös."][1] == ("Közös.", 0.6)
         assert scores["Közös. Kettő."][0] == ("Közös.", 0.6)
 
+    def test_sentences_are_repaired(self, fake_st):
+        _, model = fake_st
+        _scores_by_sentence(model, {})
+        text = "2. Az alperes fizet. Kész."
+
+        CrossEncoderSentenceExtractor(nlp=FakeNLP()).score_sentences("Q", [_chunk(text)])
+        assert [s for _, s in model.predict.call_args.args[0]] == [
+            "2. Az alperes fizet.",
+            "Kész.",
+        ]
+
+        CrossEncoderSentenceExtractor(nlp=FakeNLP(), repair_sentences=False).score_sentences(
+            "Q", [_chunk(text)]
+        )
+        assert [s for _, s in model.predict.call_args.args[0]] == [
+            "2.",
+            "Az alperes fizet.",
+            "Kész.",
+        ]
+
     def test_scores_are_plain_floats(self, fake_st):
         np = pytest.importorskip("numpy")
         _, model = fake_st

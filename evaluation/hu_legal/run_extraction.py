@@ -55,6 +55,17 @@ Metrics per setting, overall and split by query_type, legal_domain, difficulty a
   a gold chunk), a proxy until gold spans are annotated.
 - word-level precision/recall/F1 (SQuAD-style token overlap) against gold_spans, only for
   queries that have them (n_gold). None do until the annotation pass is merged.
+- abstention_sweep (retrieved mode, crossencoder and overlap): a query is answered at
+  threshold t iff its best sentence score is >= t, so every t in SWEEP_GRID (0 to 1 in 0.05
+  steps) is scored from one number per query: correct_abstention (unanswerable queries left
+  unanswered), false_abstention, abstention_accuracy and balanced_accuracy. `suggested` is the
+  t with the most correct abstention whose false abstention stays <= --max-false-abstention
+  (lowest t on ties), or None when no t qualifies. t = 0 answers every query with at least
+  one scored sentence (empty or blank retrieval still abstains). Pick t on dev, not test.
+
+Sentences are HuSpaCy's, repaired by verbatim_rag.hungarian_sentences (enumerators attached to
+their sentence, breaks after abbreviations undone); --no-sentence-repair keeps the raw splits
+for A/B runs.
 
 The run log in runs/ holds the config and aggregates only, no corpus text.
 --dump-predictions writes per-query spans and scores under data/predictions/ (gitignored,
@@ -93,6 +104,7 @@ MODES = ("oracle", "retrieved")
 EXTRACTORS = ("crossencoder", "llm", "overlap")
 SCORING_EXTRACTORS = ("crossencoder", "overlap")  # per-sentence scores: threshold sweep + chunk_auc
 RETRIEVED_BREAKDOWNS = BREAKDOWNS + ["unanswerable_reason"]
+SWEEP_GRID = tuple(round(0.05 * i, 2) for i in range(21))
 
 _WORD_RE = re.compile(r"\w+")
 
@@ -263,6 +275,52 @@ def breakdown(rows: List[Dict[str, Any]], setting: str, mode: str, field: str) -
     return {value: summarize(group, setting, mode) for value, group in sorted(groups.items())}
 
 
+def abstention_sweep(
+    rows: List[Dict[str, Any]], max_false_abstention: float, grid: Iterable[float] = SWEEP_GRID
+) -> Dict[str, Any]:
+    """Abstention metrics per threshold from each row's max_score (None = no sentence, always
+    abstains), and the threshold with the most correct abstention whose false abstention
+    stays within max_false_abstention (lowest t on ties; None when none qualifies)."""
+    ans = [r["max_score"] for r in rows if r["answerable"]]
+    unans = [r["max_score"] for r in rows if not r["answerable"]]
+
+    def abstains(score, t):
+        return score is None or score < t
+
+    table = []
+    for t in grid:
+        false_abs = _mean(abstains(s, t) for s in ans)
+        correct_abs = _mean(abstains(s, t) for s in unans)
+        table.append(
+            {
+                "t": t,
+                "correct_abstention": correct_abs,
+                "false_abstention": false_abs,
+                "abstention_accuracy": _mean(
+                    [not abstains(s, t) for s in ans] + [abstains(s, t) for s in unans]
+                ),
+                "balanced_accuracy": None
+                if correct_abs is None or false_abs is None
+                else (correct_abs + 1 - false_abs) / 2,
+            }
+        )
+    eligible = [
+        row
+        for row in table
+        if row["correct_abstention"] is not None
+        and row["false_abstention"] is not None
+        and row["false_abstention"] <= max_false_abstention + 1e-12
+    ]
+    suggested = max(eligible, key=lambda row: (row["correct_abstention"], -row["t"]), default=None)
+    return {
+        "max_false_abstention": max_false_abstention,
+        "n_answerable": len(ans),
+        "n_unanswerable": len(unans),
+        "table": table,
+        "suggested": suggested,
+    }
+
+
 def setting_names(extractor: str, thresholds: List[float]) -> List[str]:
     if extractor in SCORING_EXTRACTORS:
         return [f"{extractor}@{t:g}" for t in thresholds]
@@ -360,6 +418,13 @@ def parse_thresholds(value: str) -> List[float]:
     return thresholds
 
 
+def parse_rate(value: str) -> float:
+    rate = float(value)
+    if not 0.0 <= rate <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 1]: {value!r}")
+    return rate
+
+
 # ---- extractors ------------------------------------------------------------
 
 
@@ -369,7 +434,7 @@ def make_extractor(args, nlp=None):
             import spacy
 
             nlp = spacy.load(args.bm25_model, exclude=["parser", "ner"])
-        return OverlapScorer(nlp)
+        return OverlapScorer(nlp, repair_sentences=not args.no_sentence_repair)
     if args.extractor == "crossencoder":
         from verbatim_rag.cross_encoder_extractor import CrossEncoderSentenceExtractor
 
@@ -385,6 +450,7 @@ def make_extractor(args, nlp=None):
             max_length=args.ce_max_length,
             spacy_model=args.bm25_model,
             nlp=nlp,
+            repair_sentences=not args.no_sentence_repair,
         )
     from verbatim_core.extractors import LLMSpanExtractor
     from verbatim_core.llm_client import LLMClient
@@ -401,8 +467,9 @@ class OverlapScorer:
     floor a judge variant has to beat. Flattered here: synthetic queries are written from
     their passage."""
 
-    def __init__(self, nlp):
+    def __init__(self, nlp, repair_sentences: bool = True):
         self.nlp = nlp
+        self.repair_sentences = repair_sentences
 
     @staticmethod
     def _words(text: str) -> set:
@@ -416,7 +483,10 @@ class OverlapScorer:
         scores: Dict[str, List[Tuple[str, float]]] = {text: [] for text in texts}
         todo = [text for text in dict.fromkeys(texts) if text.strip()]
         for text, doc in zip(todo, self.nlp.pipe(todo, batch_size=64)):
-            for start, end in CrossEncoderSentenceExtractor._sentence_offsets(text, doc):
+            offsets = CrossEncoderSentenceExtractor._sentence_offsets(
+                text, doc, self.repair_sentences
+            )
+            for start, end in offsets:
                 sentence = text[start:end]
                 overlap = len(self._words(sentence) & qwords) / len(qwords) if qwords else 0.0
                 scores[text].append((sentence, overlap))
@@ -546,6 +616,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         type=parse_thresholds,
         default=parse_thresholds("0.3,0.5,0.7,0.9"),
         help="Comma-separated sentence score cutoffs (crossencoder, overlap), each a setting",
+    )
+    g.add_argument(
+        "--no-sentence-repair",
+        action="store_true",
+        help="Raw HuSpaCy sentences, without verbatim_rag.hungarian_sentences (crossencoder, "
+        "overlap)",
+    )
+    g.add_argument(
+        "--max-false-abstention",
+        type=parse_rate,
+        default=0.10,
+        help="retrieved mode: cap on false abstention for the suggested sweep threshold",
     )
     p.add_argument(
         "--distractors",
@@ -738,6 +820,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "auc": chunk_auc_pairs(scores, results, gold_ids, q.get("passage"))
                 if scores is not None and q["answerable"]
                 else None,
+                "max_score": None
+                if scores is None
+                else max((p for scored in scores.values() for _, p in scored), default=None),
                 "settings": {s: score_prediction(preds[s], results, q) for s in settings},
             }
             if counter is not None:
@@ -788,6 +873,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         }
         for s in settings
     }
+    sweep = (
+        abstention_sweep(rows, args.max_false_abstention)
+        if retrieved and args.extractor in SCORING_EXTRACTORS
+        else None
+    )
     extractor_config: Dict[str, Any]
     if args.extractor == "crossencoder":
         extractor_config = {
@@ -798,12 +888,16 @@ def main(argv: Optional[List[str]] = None) -> None:
             "activation": "sigmoid",
             "device": str(extractor.model.device),
             "thresholds": args.thresholds,
+            "max_false_abstention": args.max_false_abstention,
+            "sentence_repair": extractor.repair_sentences,
             "spacy_model": args.bm25_model,
             "spacy_model_version": extractor.nlp.meta.get("version"),
         }
     elif args.extractor == "overlap":
         extractor_config = {
             "thresholds": args.thresholds,
+            "max_false_abstention": args.max_false_abstention,
+            "sentence_repair": extractor.repair_sentences,
             "spacy_model": args.bm25_model,
             "spacy_model_version": extractor.nlp.meta.get("version"),
         }
@@ -868,6 +962,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             else None,
         },
         "results": results_by_setting,
+        "abstention_sweep": sweep,
     }
     args.runs_dir.mkdir(parents=True, exist_ok=True)
     out = args.runs_dir / f"extraction-{tag}.json"
@@ -894,6 +989,26 @@ def main(argv: Optional[List[str]] = None) -> None:
             print(f"WARNING {s}: {o['extractor_errors']} extractor errors scored as no spans")
         if o.get("dropped_spans"):
             print(f"{s}: {o['dropped_spans']} LLM spans dropped as not verbatim")
+    if sweep is not None:
+        print_sweep(sweep, fmt, args.split)
+
+
+def print_sweep(sweep: Dict[str, Any], fmt, split: str) -> None:
+    columns = ["correct_abstention", "false_abstention", "abstention_accuracy", "balanced_accuracy"]
+    print(f"\nabstention sweep on {split} (answered iff best sentence score >= t)")
+    print(f"{'t':>5} " + " ".join(f"{c:>19}" for c in columns))
+    for row in sweep["table"]:
+        print(f"{row['t']:>5.2f} " + " ".join(f"{fmt(row[c]):>19}" for c in columns))
+    cap, best = sweep["max_false_abstention"], sweep["suggested"]
+    if best is None:
+        print(f"no threshold keeps false abstention <= {cap:g}")
+    else:
+        print(
+            f"suggested t={best['t']:g} (false abstention <= {cap:g}): correct abstention "
+            f"{fmt(best['correct_abstention'])}, false abstention {fmt(best['false_abstention'])}"
+        )
+    if split != "dev":
+        print("pick the threshold on the dev split; report test only once")
 
 
 if __name__ == "__main__":
