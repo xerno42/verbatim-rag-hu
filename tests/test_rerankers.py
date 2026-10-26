@@ -126,6 +126,16 @@ class TestJinaV3Reranker:
         out = JinaV3Reranker().rerank("q", _results(3))
         assert [r.id for r in out] == ["c1", "c2", "c0"]
 
+    def test_unaccented_question_is_restored_from_the_candidates(self, fake_auto_model):
+        _, model = fake_auto_model
+        model.rerank.return_value = _ranking([0, 1])
+        results = _results(2)
+        results[0].text = "A szerződés díja."
+        JinaV3Reranker().rerank("szerzodes dija", results)
+        assert model.rerank.call_args.args[0] == "szerződés díja"
+        JinaV3Reranker(restore_accents=False).rerank("szerzodes dija", results)
+        assert model.rerank.call_args.args[0] == "szerzodes dija"
+
     def test_tail_beyond_rerank_k_is_kept_in_order(self, fake_auto_model):
         _, model = fake_auto_model
         model.rerank.return_value = _ranking([1, 0])

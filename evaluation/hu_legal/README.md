@@ -114,6 +114,43 @@ to pick the crossencoder threshold, and report test only once. Run logs go to
 `runs/extraction-<tag>.json` as aggregates only. `--dump-predictions` writes per-query spans and
 scores to `data/predictions/` for error analysis.
 
+## Questions typed without accents
+
+The synthetic queries carry full accents, but users often type `szerzodes` for `szerződés`.
+That breaks the lemma BM25 channel, because HuSpaCy cannot lemmatize the unaccented form. Two
+measures address it:
+
+- **Accent-folded BM25 channel** (`--folded`, weight `--folded-weight`, default 0.5). It is
+  BM25 over accent-folded surface forms, fused by RRF with dense and lemma BM25. It lives in
+  its own Milvus Lite db next to the index (`milvus_folded.db`, `bm25_hu_folded_stats.json`,
+  `folded_meta.json`), so existing indexes stay valid. The first run with `--folded` adds it to
+  an existing index dir with a spaCy pass, no dense model. `run_retrieval --folded` reports
+  `folded` and `fused_folded` next to the other methods and reranks `fused_folded`.
+- **Accent restoration** (on by default; `--no-accent-restore` turns it off). The reranker and
+  the cross-encoder or overlap judge get a question with no diacritic at all back with its
+  accents. Each word is replaced by its most frequent accented form in the chunks that
+  component scores, and only when that form outnumbers every other form, the plain one
+  included (ties keep the word as typed). Accented questions are
+  not changed, so runs on the unmodified queries are unaffected.
+
+`--strip-query-accents` drops the accents from every query, which is how both are measured.
+One retrieval run reports `fused` and `fused_folded` side by side. The extraction runs then
+reuse its index, with and without the folded channel and the restoration:
+
+```bash
+python -m evaluation.hu_legal.run_retrieval --split dev --strip-query-accents --folded --rerank --tag dev-noacc
+python -m evaluation.hu_legal.run_extraction --mode retrieved --split dev --index-tag dev-noacc --rerank --strip-query-accents [--folded] [--no-accent-restore]
+```
+
+A spot check on 200 dev queries (word level, stripped and then restored, not an eval run):
+- Restoring from the gold chunks alone brings back 27% of the accented words, and wrongly
+  accents 2 of 1,370 plain words.
+- Restoring from the gold chunks plus 99 random chunks, about the reranker's view, brings back
+  56% and wrongly accents 9.
+
+Words that the chunks only hold in another inflected form stay unaccented, so the extractor,
+which sees only `--extract-k` chunks, restores less than the reranker.
+
 ## Demo
 
 ```bash
@@ -138,6 +175,9 @@ The extractor can be switched per query in the UI:
 
 The server reuses `data/index/<tag>/` only when `index_meta.json` matches. Pass `--build` to
 build an index when none is complete. The server never rebuilds a completed one.
+`--folded` adds the accent-folded BM25 channel (see above). With `--build` it is added next to
+an existing index, and without it, a missing channel stops the server at startup. Accent
+restoration is on, and `--no-accent-restore` turns it off.
 
 Behavior worth knowing during a demo:
 - Spans that fail the verbatim check are dropped and logged.

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from verbatim_rag.embedding_providers import SparseEmbeddingProvider
+from verbatim_rag.hungarian_accents import fold
 
 logger = logging.getLogger(__name__)
 
@@ -232,3 +233,43 @@ class HungarianBM25Provider(SparseEmbeddingProvider):
 
     def get_dimension(self) -> int:
         return 2**31
+
+
+# Bump whenever HungarianFoldedBM25Provider._term() changes.
+FOLDED_ANALYZER_VERSION = 1
+
+
+class HungarianFoldedBM25Provider(HungarianBM25Provider):
+    """BM25 over accent-folded surface forms, for questions typed without accents.
+
+    A second sparse channel next to the lemma one: "szerzodes" matches "szerződés", which the
+    lemma channel misses because HuSpaCy cannot lemmatize the unaccented form. Surface forms,
+    not lemmas, for the same reason; inflected forms therefore only match themselves.
+
+    Stop words are dropped by their folded form on both sides, so the unaccented "es" goes
+    the same way as "és". The price: content words whose folded form is a folded stop word
+    ("hat" six vs "hát", "fele" half vs "felé", "tobb") are dropped from this channel too; the
+    lemma channel still has them. Its stats are tagged with analyzer "folded", so a lemma stats file is
+    never loaded by this provider or the other way round.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._folded_stops = {fold(w) for w in self.nlp.Defaults.stop_words}
+
+    def _term(self, t) -> Optional[str]:
+        if t.is_alpha:
+            if t.is_stop:
+                return None
+            form = fold(t.text)
+        else:
+            term = HungarianBM25Provider._term(t)
+            form = fold(term) if term else None
+        return None if form in self._folded_stops else form
+
+    def _config(self) -> Dict[str, Any]:
+        return {
+            **super()._config(),
+            "analyzer": "folded",
+            "folded_analyzer_version": FOLDED_ANALYZER_VERSION,
+        }

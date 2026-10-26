@@ -191,11 +191,12 @@ class TestIndexDir:
 class TestPrepareIndexDir:
     corpus = [{"chunk_id": "c1", "text": "szöveg"}]
 
-    def args(self, tmp_path, build=False):
+    def args(self, tmp_path, build=False, folded=False):
         return SimpleNamespace(
             data_dir=tmp_path,
             index_tag="demo",
             build=build,
+            folded=folded,
             dense_model="Qwen/Qwen3-Embedding-0.6B",
             dense_revision=None,
             bm25_model="hu_core_news_lg",
@@ -215,6 +216,30 @@ class TestPrepareIndexDir:
         run_dir = self.completed(tmp_path, args, self.corpus)
         assert prepare_index_dir(args, self.corpus) == (run_dir, True)
         assert (run_dir / "milvus.db").exists()  # --build never touches a completed index
+
+    def test_folded_channel_missing_without_build_exits(self, tmp_path):
+        pytest.importorskip("verbatim_rag.hungarian_bm25")
+        args = self.args(tmp_path, folded=True)
+        self.completed(tmp_path, args, self.corpus)
+        with pytest.raises(SystemExit, match="folded channel.*--build"):
+            prepare_index_dir(args, self.corpus)
+        args.build = True
+        assert prepare_index_dir(args, self.corpus)[1] is True  # index kept, channel added later
+
+    def test_completed_folded_channel_is_reused_and_checked(self, tmp_path):
+        pytest.importorskip("verbatim_rag.hungarian_bm25")
+        from evaluation.hu_legal.run_retrieval import FOLDED_DB, FOLDED_META, folded_meta
+
+        args = self.args(tmp_path, folded=True)
+        run_dir = self.completed(tmp_path, args, self.corpus)
+        (run_dir / FOLDED_DB).write_text("db")
+        meta = folded_meta(self.corpus, args)
+        (run_dir / FOLDED_META).write_text(json.dumps(meta), encoding="utf-8")
+        assert prepare_index_dir(args, self.corpus) == (run_dir, True)
+        meta["bm25_folded"]["k1"] = 2.0
+        (run_dir / FOLDED_META).write_text(json.dumps(meta), encoding="utf-8")
+        with pytest.raises(SystemExit, match="does not match"):
+            prepare_index_dir(args, self.corpus)
 
     def test_mismatched_index_exits(self, tmp_path):
         args = self.args(tmp_path)

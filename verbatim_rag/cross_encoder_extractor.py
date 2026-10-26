@@ -22,6 +22,9 @@ exact substring of its source chunk by construction. The offsets are repaired by
 they introduce, breaks after "vtsz."-style abbreviations are undone) unless
 `repair_sentences=False`.
 
+A question typed without accents is scored with its accents restored from the chunks' word
+forms (`restore_accents=False` turns this off); accented questions are scored as written.
+
 The scores are not calibrated for this task; tune `threshold` on the dev split.
 """
 
@@ -31,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from verbatim_core.extractors import SpanExtractor
 
+from verbatim_rag.hungarian_accents import restore_accents as _restore_accents
 from verbatim_rag.hungarian_sentences import repair_offsets
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,7 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
         nlp: Optional[Any] = None,
         spacy_batch_size: int = 64,
         repair_sentences: bool = True,
+        restore_accents: bool = True,
     ):
         """
         Args:
@@ -65,6 +70,8 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
                 HungarianBM25Provider already holds.
             spacy_batch_size: nlp.pipe batch size.
             repair_sentences: Repair HuSpaCy sentence boundaries (see the module docstring).
+            restore_accents: Score a question typed without any diacritic with its accents
+                restored from the chunks' word forms (`hungarian_accents.restore_accents`).
         """
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"threshold must be in [0, 1], got {threshold}")
@@ -84,6 +91,7 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
         self.nlp = nlp
         self.spacy_batch_size = spacy_batch_size
         self.repair_sentences = repair_sentences
+        self.restore_accents = restore_accents
 
         self.model_name = model
         self.revision = revision
@@ -141,6 +149,8 @@ class CrossEncoderSentenceExtractor(SpanExtractor):
         # A pair depends only on the sentence, so a sentence repeated across overlapping
         # chunks gets the same score; score each distinct sentence once.
         distinct = list(dict.fromkeys(sentence for _, sentence in sentences))
+        if self.restore_accents:
+            question = _restore_accents(question, todo)
         predicted = self.model.predict(
             [(question, sentence) for sentence in distinct],
             batch_size=self.batch_size,

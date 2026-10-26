@@ -166,6 +166,18 @@ class TestExtractSpans:
 
 
 class TestScores:
+    def test_unaccented_question_is_restored_from_the_chunks(self, fake_st):
+        _, model = fake_st
+        _scores_by_sentence(model, {})
+        chunks = [_chunk("A felmondási idő harminc nap.")]
+        CrossEncoderSentenceExtractor(nlp=FakeNLP()).score_sentences("felmondasi ido", chunks)
+        assert model.predict.call_args.args[0] == [
+            ("felmondási idő", "A felmondási idő harminc nap.")
+        ]
+        extractor = CrossEncoderSentenceExtractor(nlp=FakeNLP(), restore_accents=False)
+        extractor.score_sentences("felmondasi ido", chunks)
+        assert model.predict.call_args.args[0][0][0] == "felmondasi ido"
+
     def test_duplicate_chunk_texts_are_scored_once(self, fake_st):
         _, model = fake_st
         _scores_by_sentence(model, {"Egy.": 0.7})

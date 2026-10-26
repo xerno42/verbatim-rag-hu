@@ -43,7 +43,8 @@ export const ExtractorToggle = ({ demo, extractor, setExtractor, disabled }) => 
       </span>
     </div>
     <p className="text-xs lg:text-sm text-muted-foreground">
-      Fused BM25 + {demo.dense_model?.split('/').pop()} top {demo.retrieve_k} →{' '}
+      Fused BM25 {demo.folded_weight ? '+ accent-folded BM25 ' : ''}+{' '}
+      {demo.dense_model?.split('/').pop()} top {demo.retrieve_k} →{' '}
       {demo.rerank_model?.split('/').pop()} → extraction on the top {demo.extract_k} chunks
     </p>
   </div>

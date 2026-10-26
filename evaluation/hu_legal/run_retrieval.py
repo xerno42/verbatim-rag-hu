@@ -14,6 +14,12 @@ With --rerank, the top-100 of the fused list (or of the single method when only 
 runs) is reranked by Jina reranker v3.5 and reported as a fourth method, "reranked". It is a
 permutation of the same 100 candidates, so its Recall@100 equals its input's; Recall@10 and
 MRR are what change. Extraction and abstention are measured by run_extraction.
+
+--folded adds the accent-folded BM25 channel (its own Milvus db and stats next to the index,
+with folded_meta.json) as two more methods: "folded" alone and "fused_folded", the RRF of dense,
+sparse and folded, which then feeds the reranker. --strip-query-accents drops the accents of
+every query, to measure questions typed without them; the reranker restores them from its
+candidates unless --no-accent-restore.
 Unanswerable queries are skipped here; only their count is reported.
 
 The index and BM25 stats go under data/index/<tag>/ (gitignored, licence), with an
@@ -41,6 +47,8 @@ RUNS = HERE / "runs"
 BREAKDOWNS = ["query_type", "legal_domain", "difficulty", "bucket"]
 CUTOFFS = (10, 100)
 METHODS = ("sparse", "dense", "fused")
+FOLDED = "folded"  # accent-folded BM25, its own Milvus db next to the main index
+FUSED_FOLDED = "fused_folded"  # RRF of dense, sparse and folded
 RERANKED = "reranked"
 
 logger = logging.getLogger("hu_legal.run_retrieval")
@@ -207,12 +215,159 @@ def write_index_meta(run_dir: Path, meta: Dict[str, Any]) -> None:
     (run_dir / INDEX_META).write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
+# The folded channel sits next to the main index with its own meta file, so index_meta.json
+# and every index built before it stay valid, and it can be added to an existing index dir.
+FOLDED_META = "folded_meta.json"
+FOLDED_DB = "milvus_folded.db"
+FOLDED_STATS = "bm25_hu_folded_stats.json"
+_REBUILD_FOLDED = f"delete {FOLDED_META}, {FOLDED_DB} and {FOLDED_STATS} there to rebuild it"
+
+
+def folded_meta(corpus: List[Dict[str, Any]], args) -> Dict[str, Any]:
+    from verbatim_rag.hungarian_bm25 import ANALYZER_VERSION, FOLDED_ANALYZER_VERSION
+
+    return {
+        "corpus_chunks": len(corpus),
+        "corpus_sha256": corpus_fingerprint(corpus),
+        "chunk_text": "raw corpus text",
+        "bm25_folded": {
+            "model": args.bm25_model,
+            "k1": args.k1,
+            "b": args.b,
+            # The folded rule delegates non-alphabetic tokens to the lemma provider's rule.
+            "analyzer_version": ANALYZER_VERSION,
+            "folded_analyzer_version": FOLDED_ANALYZER_VERSION,
+        },
+    }
+
+
+def check_folded_meta(run_dir: Path, expected: Dict[str, Any]) -> bool:
+    """True when run_dir holds a completed folded channel built with these settings, False
+    when it holds none; raises when it holds one built with other settings."""
+    path = run_dir / FOLDED_META
+    if not path.exists():
+        return False
+    found = json.loads(path.read_text(encoding="utf-8"))
+    if found != expected:
+        diff = {
+            k: {"index": found.get(k), "run": expected.get(k)}
+            for k in sorted(set(found) | set(expected))
+            if found.get(k) != expected.get(k)
+        }
+        raise ValueError(
+            f"folded channel in {run_dir} does not match this run: {json.dumps(diff)}; "
+            f"{_REBUILD_FOLDED}"
+        )
+    if not (run_dir / FOLDED_DB).exists():
+        raise ValueError(f"{run_dir / FOLDED_DB} missing next to {FOLDED_META}; {_REBUILD_FOLDED}")
+    return True
+
+
+def open_folded_index(run_dir: Path, corpus: List[Dict[str, Any]], nlp, args, build: bool):
+    """(QueryCache over the folded BM25 provider, its sparse-only VerbatimIndex).
+
+    Reuses a completed folded channel in run_dir, or builds one when `build` is set (a spaCy
+    pass over the corpus, no dense model). Shares `nlp` with the lemma provider.
+    """
+    from verbatim_rag.hungarian_bm25 import HungarianFoldedBM25Provider
+    from verbatim_rag.index import VerbatimIndex
+    from verbatim_rag.vector_stores import LocalMilvusStore
+
+    expected = folded_meta(corpus, args)
+    reuse = check_folded_meta(run_dir, expected)
+    if not reuse:
+        if not build:
+            raise ValueError(f"no completed folded channel in {run_dir}")
+        for name in (FOLDED_DB, FOLDED_STATS):  # leftovers of an interrupted build
+            (run_dir / name).unlink(missing_ok=True)
+    folded = QueryCache(
+        HungarianFoldedBM25Provider(
+            stats_path=str(run_dir / FOLDED_STATS),
+            model=args.bm25_model,
+            k1=args.k1,
+            b=args.b,
+            batch_size=args.batch_size,
+            nlp=nlp,
+        )
+    )
+    db_path = run_dir / FOLDED_DB
+    if not reuse:
+        logger.info("building the folded BM25 channel in %s", db_path)
+        index = build_index(corpus, db_path, folded, None, args.batch_size)
+        (run_dir / FOLDED_META).write_text(json.dumps(expected, indent=2), encoding="utf-8")
+        return folded, index
+    if folded._provider._stale_reason:  # fail now, not on the first query
+        raise ValueError(f"{folded._provider._stale_reason}; {_REBUILD_FOLDED}")
+    if not folded._provider.fitted_on(row["text"] for row in corpus):
+        raise ValueError(
+            f"folded BM25 stats in {run_dir} were not fitted on this corpus; {_REBUILD_FOLDED}"
+        )
+    store = LocalMilvusStore(db_path=str(db_path), enable_dense=False, enable_sparse=True)
+    rows = store.client.query(
+        collection_name=store.collection_name, filter="", output_fields=["count(*)"]
+    )[0]["count(*)"]
+    if rows != len(corpus):
+        raise ValueError(f"folded index {db_path} holds {rows} chunks, corpus has {len(corpus)}")
+    return folded, VerbatimIndex(vector_store=store, sparse_provider=folded)
+
+
+# ---- accents ---------------------------------------------------------------
+
+
+def add_accent_args(p) -> None:
+    """Flags shared by run_retrieval and run_extraction (folded channel, unaccented queries)."""
+    p.add_argument(
+        "--folded",
+        action="store_true",
+        help="Add the accent-folded BM25 channel (own Milvus db next to the index) to the fusion",
+    )
+    p.add_argument("--folded-weight", type=float, default=0.5)
+    p.add_argument(
+        "--strip-query-accents",
+        action="store_true",
+        help="Drop the accents from every query, to measure questions typed without them",
+    )
+    p.add_argument(
+        "--no-accent-restore",
+        action="store_true",
+        help="Do not restore the accents of an unaccented question before the reranker and "
+        "the sentence judge",
+    )
+
+
+def apply_query_accents(queries: List[Dict[str, Any]], args) -> List[Dict[str, Any]]:
+    if not args.strip_query_accents:
+        return queries
+    from verbatim_rag.hungarian_accents import strip_accents
+
+    return [{**q, "query": strip_accents(q["query"])} for q in queries]
+
+
+def count_unaccented(queries: List[Dict[str, Any]]) -> int:
+    """Queries without any diacritic: the ones accent restoration acts on."""
+    from verbatim_rag.hungarian_accents import has_diacritics
+
+    return sum(not has_diacritics(q["query"]) for q in queries)
+
+
 # ---- run -------------------------------------------------------------------
 
 
 def rerank_source(methods: Sequence[str]) -> str:
-    """The method whose top-k feeds the reranker: fused when available, else the only method."""
-    return "fused" if "fused" in methods else methods[0]
+    """The method whose top-k feeds the reranker: the widest fusion available, else the only
+    method."""
+    for method in (FUSED_FOLDED, "fused"):
+        if method in methods:
+            return method
+    return methods[0]
+
+
+def fusion_weights(args) -> Dict[str, float]:
+    """RRF weights per method; folded only when the run has the folded channel."""
+    weights = {"dense": args.dense_weight, "sparse": args.sparse_weight}
+    if getattr(args, "folded", False):
+        weights[FOLDED] = args.folded_weight
+    return weights
 
 
 def run_queries(
@@ -221,16 +376,28 @@ def run_queries(
     methods: Sequence[str],
     args,
     reranker=None,
+    folded_index=None,
 ) -> List[Dict]:
     k = max(CUTOFFS)
     source = rerank_source(methods)
     fused_weights = {"dense": args.dense_weight, "sparse": args.sparse_weight}
+    fused_folded = None
+    if folded_index is not None:
+        from verbatim_rag.fused_index import FusedIndex
+
+        fused_folded = FusedIndex(index, {FOLDED: folded_index})
     rows = []
     for i, q in enumerate(queries, start=1):
         ranks = {}
         for method in methods:
             if method == "fused":
                 hits = index.query(q["query"], k=k, hybrid_weights=fused_weights, rrf_k=args.rrf_k)
+            elif method == FUSED_FOLDED:
+                hits = fused_folded.query(
+                    q["query"], k=k, hybrid_weights=fusion_weights(args), rrf_k=args.rrf_k
+                )
+            elif method == FOLDED:
+                hits = folded_index.query(q["query"], k=k, search_type="sparse")
             else:
                 hits = index.query(q["query"], k=k, search_type=method)
             ranks[method] = first_hit_rank([h.id for h in hits], q["gold_chunk_ids"])
@@ -273,6 +440,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--b", type=float, default=0.75)
     p.add_argument("--dense-weight", type=float, default=0.5)
     p.add_argument("--sparse-weight", type=float, default=0.5)
+    add_accent_args(p)
     p.add_argument("--seed", type=int, default=0, help="Seed for the --limit sample")
     p.add_argument("--rrf-k", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=16, help="Indexing/embedding batch size")
@@ -288,6 +456,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         p.error("--rerank-block-tokens needs --rerank")
     if args.skip_dense and args.skip_sparse:
         p.error("nothing to run: both providers skipped")
+    if args.folded and (args.skip_dense or args.skip_sparse):
+        p.error("--folded needs both providers (it fuses dense, sparse and folded)")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     started = datetime.now(timezone.utc)
@@ -299,6 +469,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     n_unanswerable = len(split) - len(queries)
     if args.limit is not None:
         queries = random.Random(args.seed).sample(queries, min(args.limit, len(queries)))
+    queries = apply_query_accents(queries, args)
     manifest_path = args.data_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     logger.info(
@@ -354,18 +525,27 @@ def main(argv: Optional[List[str]] = None) -> None:
             device=args.device,
             revision=args.rerank_revision,
             max_block_tokens=args.rerank_block_tokens,
+            restore_accents=not args.no_accent_restore,
         )
     db_path = run_dir / "milvus.db"
     t0 = time.time()
     index = build_index(corpus, db_path, sparse, dense, args.batch_size)
+    folded = folded_index = None
+    if args.folded:
+        folded, folded_index = open_folded_index(
+            run_dir, corpus, sparse._provider.nlp, args, build=True
+        )
     index_seconds = time.time() - t0
     write_index_meta(run_dir, index_meta(corpus, args, dense is not None, sparse is not None))
 
     methods = [m for m in METHODS if (m != "sparse" or sparse) and (m != "dense" or dense)]
     if not (sparse and dense):
         methods = [m for m in methods if m != "fused"]
+    if folded_index is not None:
+        methods[methods.index("fused") : methods.index("fused")] = [FOLDED]
+        methods.append(FUSED_FOLDED)
     t0 = time.time()
-    rows = run_queries(index, queries, methods, args, reranker)
+    rows = run_queries(index, queries, methods, args, reranker, folded_index)
     query_seconds = time.time() - t0
 
     reported = methods + [RERANKED] if reranker is not None else methods
@@ -401,8 +581,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             "fusion": {
                 "dense_weight": args.dense_weight,
                 "sparse_weight": args.sparse_weight,
+                "folded_weight": args.folded_weight if folded else None,
                 "rrf_k": args.rrf_k,
             },
+            "folded_index": folded_meta(corpus, args)["bm25_folded"] if folded else None,
+            "query_accents": "stripped" if args.strip_query_accents else "as written",
+            "accent_restore": not args.no_accent_restore,
             "rerank": None
             if reranker is None
             else {
@@ -422,6 +606,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             "excluded_by_annotation": n_excluded,
         },
         "empty_sparse_queries": None if sparse is None else sparse.empty,
+        "empty_folded_queries": None if folded is None else folded.empty,
+        "unaccented_queries": count_unaccented(queries),
         "seconds": {"index": round(index_seconds), "query": round(query_seconds)},
         "results": results,
     }
@@ -430,12 +616,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     out.write_text(json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"\n{args.split} split, {len(queries)} answerable queries -> {out}")
-    print(f"{'method':8} " + " ".join(f"{m:>11}" for m in ("recall@10", "recall@100", "mrr@100")))
+    print(f"{'method':12} " + " ".join(f"{m:>11}" for m in ("recall@10", "recall@100", "mrr@100")))
     for method in reported:
         o = results[method]["overall"]
-        print(f"{method:8} {o['recall@10']:11.3f} {o['recall@100']:11.3f} {o['mrr@100']:11.3f}")
+        print(f"{method:12} {o['recall@10']:11.3f} {o['recall@100']:11.3f} {o['mrr@100']:11.3f}")
     if sparse is not None:
         print(f"empty sparse query vectors: {sparse.empty}")
+    if folded is not None:
+        print(f"empty folded query vectors: {folded.empty}")
 
 
 if __name__ == "__main__":

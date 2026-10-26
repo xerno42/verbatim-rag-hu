@@ -39,9 +39,15 @@ Differences from the generic API (api/app.py), which this server replaces for th
   retrieval and rerank take. LLM calls time out after 60 s (one retry), so an extraction
   left running by a closed tab holds up the next query at most that long.
 
+A question typed without accents gets them back from the candidates' word forms before the
+reranker and the cross-encoder (--no-accent-restore turns that off). --folded adds the
+accent-folded BM25 channel to the fusion, so such a question also matches at retrieval.
+
 The index in data/index/<tag>/ is reused when its index_meta.json matches the corpus and
-provider settings (the run_extraction --index-tag check). Without a completed index, --build
-builds one there (the Qwen3 pass takes hours on CPU). Corpus and queries are CC BY-NC-ND 4.0:
+provider settings (the run_extraction --index-tag check), and with --folded the folded channel
+next to it when its folded_meta.json does. Without a completed index (or folded channel),
+--build builds it there (the Qwen3 pass takes hours on CPU; the folded channel is a spaCy pass
+only). Corpus and queries are CC BY-NC-ND 4.0:
 the server binds to 127.0.0.1 by default; don't expose it.
 """
 
@@ -66,10 +72,15 @@ from verbatim_core.templates import StaticTemplate, TemplateManager
 from evaluation.hu_legal.run_extraction import LogCounter, check_index_meta, open_index
 from evaluation.hu_legal.run_retrieval import (
     DATA,
+    FOLDED,
     INDEX_META,
     QueryCache,
+    check_folded_meta,
+    folded_meta,
+    fusion_weights,
     index_meta,
     load_split,
+    open_folded_index,
     read_jsonl,
 )
 
@@ -345,6 +356,7 @@ def make_extractors(args, nlp) -> Dict[str, SpanExtractor]:
                 max_length=args.ce_max_length,
                 nlp=nlp,
                 repair_sentences=not args.no_sentence_repair,
+                restore_accents=not args.no_accent_restore,
             )
         else:
             from verbatim_core.extractors import LLMSpanExtractor
@@ -383,8 +395,14 @@ def prepare_index_dir(args, corpus) -> tuple:
     if (run_dir / INDEX_META).exists():
         try:
             check_index_meta(run_dir, index_meta(corpus, args, dense=True, sparse=True))
+            has_folded = args.folded and check_folded_meta(run_dir, folded_meta(corpus, args))
         except ValueError as e:
             raise SystemExit(str(e)) from None
+        if args.folded and not has_folded and not args.build:
+            raise SystemExit(
+                f"no completed folded channel in {run_dir}: pass --build to add it "
+                "(a spaCy pass, the index itself is kept)"
+            )
         return run_dir, True
     if not args.build:
         raise SystemExit(
@@ -426,16 +444,25 @@ def build_pipelines(args) -> Dict[str, Any]:
         device=args.device,
         revision=args.rerank_revision,
         max_block_tokens=args.rerank_block_tokens,
+        restore_accents=not args.no_accent_restore,
     )
     # Load the extractors before indexing so a bad model id or key fails in seconds.
     extractors = make_extractors(args, nlp=sparse._provider.nlp)
     logger.info("%s index in %s", "reusing" if reuse else "building", run_dir)
     index = open_index(run_dir, corpus, sparse, dense, args, reuse)
+    if args.folded:
+        from verbatim_rag.fused_index import FusedIndex
+
+        # prepare_index_dir already refused a missing channel without --build.
+        _, folded_index = open_folded_index(
+            run_dir, corpus, sparse._provider.nlp, args, build=args.build
+        )
+        index = FusedIndex(index, {FOLDED: folded_index})
     retriever = RerankedRetriever(
         index,
         reranker,
         retrieve_k=args.retrieve_k,
-        hybrid_weights={"dense": args.dense_weight, "sparse": args.sparse_weight},
+        hybrid_weights=fusion_weights(args),
         rrf_k=args.rrf_k,
     )
     return {
@@ -504,6 +531,8 @@ def demo_info(args, n_queries: int) -> Dict[str, Any]:
         "extract_k": args.extract_k,
         "dense_model": args.dense_model,
         "rerank_model": args.rerank_model,
+        "folded_weight": args.folded_weight if args.folded else None,
+        "accent_restore": not args.no_accent_restore,
     }
     if "crossencoder" in args.extractors:
         info["crossencoder"] = {
@@ -571,6 +600,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument("--b", type=float, default=0.75)
     g.add_argument("--dense-weight", type=float, default=0.5)
     g.add_argument("--sparse-weight", type=float, default=0.5)
+    g.add_argument(
+        "--folded",
+        action="store_true",
+        help="Add the accent-folded BM25 channel to the fusion (built next to the index with "
+        "--build)",
+    )
+    g.add_argument("--folded-weight", type=float, default=0.5)
+    g.add_argument(
+        "--no-accent-restore",
+        action="store_true",
+        help="Do not restore the accents of an unaccented question before the reranker and "
+        "the cross-encoder",
+    )
     g.add_argument("--rrf-k", type=int, default=60)
     g.add_argument("--rerank-model", default="jinaai/jina-reranker-v3.5")
     g.add_argument("--rerank-revision", default=RERANK_REVISION)

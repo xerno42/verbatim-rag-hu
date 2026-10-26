@@ -433,11 +433,19 @@ class TestOverlapScorer:
         assert OverlapScorer.spans_from_scores(scores, 0.5) == {
             text: ["A felmondási idő harminc nap."]
         }
+        unaccented = "Mennyi a felmondasi ido?"
+        assert OverlapScorer(NLP()).score_sentences(unaccented, [_r("c", text)]) == scores
+        raw = OverlapScorer(NLP(), restore_accents=False)
+        assert raw.score_sentences(unaccented, [_r("c", text)])[text][0][1] == 0.0
 
     def test_make_extractor_passes_the_sentence_repair_flag(self):
         pytest.importorskip("verbatim_rag.cross_encoder_extractor")
         from evaluation.hu_legal.run_extraction import make_extractor
 
         for flag in (False, True):
-            args = SimpleNamespace(extractor="overlap", no_sentence_repair=flag)
-            assert make_extractor(args, nlp=object()).repair_sentences is not flag
+            args = SimpleNamespace(
+                extractor="overlap", no_sentence_repair=flag, no_accent_restore=flag
+            )
+            extractor = make_extractor(args, nlp=object())
+            assert extractor.repair_sentences is not flag
+            assert extractor.restore_accents is not flag

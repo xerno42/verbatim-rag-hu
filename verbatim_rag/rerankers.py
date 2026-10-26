@@ -9,6 +9,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
+from verbatim_rag.hungarian_accents import restore_accents as _restore_accents
 from verbatim_rag.vector_stores.base import SearchResult
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,10 @@ class JinaV3Reranker(BaseReranker):
     own block's context: the ranking can differ from a single pass.
 
     The block arithmetic mirrors the remote ``rerank()`` at revision e8a93f33f0b2.
+
+    With ``restore_accents`` (default), a question without any diacritic is reranked with its
+    accents restored from the candidates' word forms (``hungarian_accents.restore_accents``);
+    accented questions are passed through unchanged.
     """
 
     # max_doc_length in the remote rerank(): a block is closed once its remaining capacity
@@ -164,6 +169,7 @@ class JinaV3Reranker(BaseReranker):
         device: Optional[str] = None,
         revision: Optional[str] = None,
         max_block_tokens: Optional[int] = None,
+        restore_accents: bool = True,
     ):
         super().__init__(rerank_k=rerank_k, text_field=text_field)
         if max_block_tokens is not None and max_block_tokens <= 0:
@@ -175,6 +181,7 @@ class JinaV3Reranker(BaseReranker):
         self.model_name = model
         self.revision = revision
         self.max_block_tokens = max_block_tokens
+        self.restore_accents = restore_accents
         self.model = AutoModel.from_pretrained(
             model,
             # transformers is pinned to 4.53.3, which predates the `dtype` alias (4.56)
@@ -224,7 +231,11 @@ class JinaV3Reranker(BaseReranker):
         head, tail = self._split_results(results)
         if not head:
             return results
-        ranked = self.model.rerank(question, self._get_texts(head))
+        texts = self._get_texts(head)
+        if self.restore_accents:
+            # A question typed without accents gets them back from the candidates' word forms.
+            question = _restore_accents(question, texts)
+        ranked = self.model.rerank(question, texts)
         # Sort explicitly: the model card does not state that rerank() output is pre-sorted.
         ranked = sorted(ranked, key=lambda item: item["relevance_score"], reverse=True)
         order = [item["index"] for item in ranked]

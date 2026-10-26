@@ -63,6 +63,11 @@ Metrics per setting, overall and split by query_type, legal_domain, difficulty a
   (lowest t on ties), or None when no t qualifies. t = 0 answers every query with at least
   one scored sentence (empty or blank retrieval still abstains). Pick t on dev, not test.
 
+Unaccented questions: --strip-query-accents drops the accents of every query; the reranker and
+the scoring extractors then restore them from the chunks they score (--no-accent-restore turns
+that off). --folded (retrieved mode) adds the accent-folded BM25 channel to the fusion, built
+next to the index on first use (folded_meta.json).
+
 Sentences are HuSpaCy's, repaired by verbatim_rag.hungarian_sentences (enumerators attached to
 their sentence, breaks after abbreviations undone); --no-sentence-repair keeps the raw splits
 for A/B runs.
@@ -89,13 +94,21 @@ from evaluation.hu_legal.overlap import shingles
 from evaluation.hu_legal.run_retrieval import (
     BREAKDOWNS,
     DATA,
+    FOLDED,
     INDEX_META,
     RUNS,
     QueryCache,
+    add_accent_args,
+    apply_query_accents,
     build_index,
+    check_folded_meta,
+    count_unaccented,
+    folded_meta,
+    fusion_weights,
     git_sha,
     index_meta,
     load_split,
+    open_folded_index,
     read_jsonl,
     write_index_meta,
 )
@@ -434,7 +447,11 @@ def make_extractor(args, nlp=None):
             import spacy
 
             nlp = spacy.load(args.bm25_model, exclude=["parser", "ner"])
-        return OverlapScorer(nlp, repair_sentences=not args.no_sentence_repair)
+        return OverlapScorer(
+            nlp,
+            repair_sentences=not args.no_sentence_repair,
+            restore_accents=not args.no_accent_restore,
+        )
     if args.extractor == "crossencoder":
         from verbatim_rag.cross_encoder_extractor import CrossEncoderSentenceExtractor
 
@@ -451,6 +468,7 @@ def make_extractor(args, nlp=None):
             spacy_model=args.bm25_model,
             nlp=nlp,
             repair_sentences=not args.no_sentence_repair,
+            restore_accents=not args.no_accent_restore,
         )
     from verbatim_core.extractors import LLMSpanExtractor
     from verbatim_core.llm_client import LLMClient
@@ -467,9 +485,10 @@ class OverlapScorer:
     floor a judge variant has to beat. Flattered here: synthetic queries are written from
     their passage."""
 
-    def __init__(self, nlp, repair_sentences: bool = True):
+    def __init__(self, nlp, repair_sentences: bool = True, restore_accents: bool = True):
         self.nlp = nlp
         self.repair_sentences = repair_sentences
+        self.restore_accents = restore_accents
 
     @staticmethod
     def _words(text: str) -> set:
@@ -477,11 +496,14 @@ class OverlapScorer:
 
     def score_sentences(self, question: str, search_results: List[Any]):
         from verbatim_rag.cross_encoder_extractor import CrossEncoderSentenceExtractor
+        from verbatim_rag.hungarian_accents import restore_accents
 
-        qwords = {w for w in self._words(question) if len(w) > 3}
         texts = [getattr(r, "text", "") or "" for r in search_results]
         scores: Dict[str, List[Tuple[str, float]]] = {text: [] for text in texts}
         todo = [text for text in dict.fromkeys(texts) if text.strip()]
+        if self.restore_accents:
+            question = restore_accents(question, todo)
+        qwords = {w for w in self._words(question) if len(w) > 3}
         for text, doc in zip(todo, self.nlp.pipe(todo, batch_size=64)):
             offsets = CrossEncoderSentenceExtractor._sentence_offsets(
                 text, doc, self.repair_sentences
@@ -570,7 +592,7 @@ def open_index(run_dir: Path, corpus, sparse, dense, args, reuse: bool):
 
 def retrieve(index, question: str, args, reranker=None) -> List[Any]:
     if not (args.skip_dense or args.skip_sparse):
-        weights = {"dense": args.dense_weight, "sparse": args.sparse_weight}
+        weights = fusion_weights(args)  # with folded, index is a FusedIndex
         hits = index.query(question, k=args.retrieve_k, hybrid_weights=weights, rrf_k=args.rrf_k)
     else:
         method = "sparse" if args.skip_dense else "dense"
@@ -673,10 +695,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument("--sparse-weight", type=float, default=0.5)
     g.add_argument("--rrf-k", type=int, default=60)
     g.add_argument("--batch-size", type=int, default=16, help="Indexing/embedding batch size")
+    add_accent_args(p.add_argument_group("unaccented questions"))
     args = p.parse_args(argv)
     retrieved = args.mode == "retrieved"
     if retrieved and args.skip_dense and args.skip_sparse:
         p.error("nothing to retrieve with: both providers skipped")
+    if args.folded and not retrieved:
+        p.error("--folded only applies to --mode retrieved")
+    if args.folded and (args.skip_dense or args.skip_sparse):
+        p.error("--folded needs both providers (it fuses dense, sparse and folded)")
     if not retrieved and args.index_tag:
         p.error("--index-tag only applies to --mode retrieved")
     if args.distractors < 0 or (retrieved and args.distractors):
@@ -695,6 +722,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     n_skipped = len(split) - len(queries)
     if args.limit is not None:
         queries = random.Random(args.seed).sample(queries, min(args.limit, len(queries)))
+    queries = apply_query_accents(queries, args)
     manifest_path = args.data_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     logger.info(
@@ -720,6 +748,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             expected = index_meta(corpus, args, not args.skip_dense, not args.skip_sparse)
             try:
                 check_index_meta(run_dir, expected)
+                if args.folded:  # a missing channel is built later; a mismatched one fails here
+                    check_folded_meta(run_dir, folded_meta(corpus, args))
             except ValueError as e:
                 p.error(str(e))
             reuse = True
@@ -767,6 +797,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 device=args.device,
                 revision=args.rerank_revision,
                 max_block_tokens=args.rerank_block_tokens,
+                restore_accents=not args.no_accent_restore,
             )
 
     # Load the extractor before indexing so a bad model id fails in seconds, not hours.
@@ -776,11 +807,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         extractor.llm_client.complete("Reply with OK.")  # raises on a bad key, model or api-base
         counter = LogCounter()
         logging.getLogger("verbatim_core").addHandler(counter)
-    index = None
+    index = folded = None
     index_seconds = 0.0
     if retrieved:
         t0 = time.time()
         index = open_index(run_dir, corpus, sparse, dense, args, reuse)
+        if args.folded:
+            from verbatim_rag.fused_index import FusedIndex
+
+            # A separate db next to the index: built here when missing, even in a reused dir.
+            folded, folded_index = open_folded_index(
+                run_dir, corpus, sparse._provider.nlp, args, build=True
+            )
+            index = FusedIndex(index, {FOLDED: folded_index})
         index_seconds = time.time() - t0
 
     settings = setting_names(args.extractor, args.thresholds)
@@ -919,6 +958,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             "limit": args.limit,
             "seed": args.seed,
             "distractors": args.distractors,
+            "query_accents": "stripped" if args.strip_query_accents else "as written",
+            # The LLM extractor never restores; the reranker does when there is one.
+            "accent_restore": not args.no_accent_restore,
             args.extractor: extractor_config,
             "retrieval": None
             if not retrieved
@@ -932,8 +974,10 @@ def main(argv: Optional[List[str]] = None) -> None:
                 else {
                     "dense_weight": args.dense_weight,
                     "sparse_weight": args.sparse_weight,
+                    "folded_weight": args.folded_weight if folded else None,
                     "rrf_k": args.rrf_k,
                 },
+                "folded_index": folded_meta(corpus, args)["bm25_folded"] if folded else None,
                 "retrieve_k": args.retrieve_k,
                 "extract_k": args.extract_k,
                 "rerank": None
@@ -953,6 +997,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             "excluded_by_annotation": n_excluded,
         },
         "empty_sparse_queries": None if sparse is None else sparse.empty,
+        "empty_folded_queries": None if folded is None else folded.empty,
+        "unaccented_queries": count_unaccented(queries),
         "seconds": {
             "index": round(index_seconds),
             "retrieve": round(retrieve_seconds),
