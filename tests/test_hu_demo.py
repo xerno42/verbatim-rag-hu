@@ -13,11 +13,14 @@ from evaluation.hu_legal.demo import (
     ABSTAIN_HU,
     CPU_BATCH_SIZE,
     GPU_BATCH_SIZE,
+    JINA_BLOCK_TOKENS,
+    RERANK_REVISION,
     TEMPLATE_HU,
     CheckedExtractor,
     HungarianStaticTemplate,
     RerankedRetriever,
     UncleanedResponseBuilder,
+    demo_info,
     hungarian_template_manager,
     index_dir,
     is_loopback,
@@ -25,6 +28,7 @@ from evaluation.hu_legal.demo import (
     prepare_index_dir,
     query_view,
     resolve_device_defaults,
+    resolve_rerank_defaults,
 )
 from evaluation.hu_legal.run_retrieval import INDEX_META, index_meta, write_index_meta
 
@@ -402,3 +406,53 @@ class TestResolveDeviceDefaults:
         a = self.args(device="auto")
         resolve_device_defaults(a)
         assert a.device == expected
+
+
+class TestResolveRerankDefaults:
+    def args(self, **kw):
+        return SimpleNamespace(
+            **{
+                "reranker": "jina",
+                "rerank_model": "jinaai/jina-reranker-v3.5",
+                "rerank_revision": None,
+                "rerank_block_tokens": None,
+                **kw,
+            }
+        )
+
+    def test_jina_runs_as_in_the_baseline(self):
+        a = self.args()
+        resolve_rerank_defaults(a)
+        assert (a.rerank_revision, a.rerank_block_tokens) == (RERANK_REVISION, JINA_BLOCK_TOKENS)
+
+    def test_explicit_jina_values_are_kept(self):
+        a = self.args(rerank_revision="abc", rerank_block_tokens=2048)
+        resolve_rerank_defaults(a)
+        assert (a.rerank_revision, a.rerank_block_tokens) == ("abc", 2048)
+
+    def test_other_jina_model_is_not_pinned_to_the_baseline_sha(self):
+        a = self.args(rerank_model="me/jina-finetune")
+        resolve_rerank_defaults(a)
+        assert (a.rerank_revision, a.rerank_block_tokens) == (None, JINA_BLOCK_TOKENS)
+
+    def test_qwen3_gets_no_jina_defaults(self):
+        a = self.args(reranker="qwen3", rerank_model="Qwen/Qwen3-Reranker-0.6B")
+        resolve_rerank_defaults(a)
+        assert (a.rerank_revision, a.rerank_block_tokens) == (None, None)
+
+
+def test_demo_info_names_the_reranker():
+    a = SimpleNamespace(
+        split="test",
+        retrieve_k=100,
+        extract_k=5,
+        dense_model="Qwen/Qwen3-Embedding-0.6B",
+        reranker="qwen3",
+        rerank_model="Qwen/Qwen3-Reranker-0.6B",
+        folded=False,
+        folded_weight=0.5,
+        no_accent_restore=False,
+        extractors=[],
+    )
+    info = demo_info(a, 3)
+    assert (info["reranker"], info["rerank_model"]) == ("qwen3", "Qwen/Qwen3-Reranker-0.6B")

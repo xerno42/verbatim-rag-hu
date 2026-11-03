@@ -94,6 +94,12 @@ completed index there unless you pass `--overwrite`. Queries annotated `"no"` (`
 scored by either runner. With `--extractor llm`, failed API calls are reported as
 `extractor_errors` instead of being counted as abstentions.
 
+`--rerank` uses `--reranker jina` (jina-reranker-v3.5, the default and the baseline) or
+`--reranker qwen3` (Qwen3-Reranker-0.6B, pointwise P(yes), Apache-2.0, not measured yet), in both
+runners and the demo. `--rerank-block-tokens` applies to jina only, and `--rerank-batch-size`
+(default 16) and `--rerank-instruction` (English task text) to qwen3 only. The run log's `rerank`
+entry records which reranker ran and its settings.
+
 For crossencoder and overlap, retrieved mode also prints an abstention sweep. A query counts as
 answered at threshold t when its best sentence score is at least t, so thresholds from 0 to 1 in
 0.05 steps are scored from one pass: correct abstention (unanswerable queries left unanswered),
@@ -161,11 +167,12 @@ cd frontend && npm install && npm run dev                            # http://lo
 
 `demo.py` serves the retrieved-mode pipeline to the React UI in `frontend/`, with an eval-query
 picker, gold-chunk marks and a verdict per query (answered from a gold chunk, correct abstention,
-retrieval miss, and so on). The pipeline is fused retrieval of the top 100, the Jina v3.5 rerank,
-extraction on the top 5, and a static Hungarian template, so no LLM writes text. `--device`
-defaults to `auto` (cuda if available, else cpu) with batch size 32 on a GPU and 16 on cpu. The
-default `--rerank-block-tokens 4096` fits a 16 GB GPU and stays on cpu, since the ranking
-depends on it.
+retrieval miss, and so on). The pipeline is fused retrieval of the top 100, the Jina v3.5 rerank
+(`--reranker qwen3` for Qwen3-Reranker-0.6B), extraction on the top 5, and a static Hungarian
+template, so no LLM writes text. `--device` defaults to `auto` (cuda if available, else cpu) with
+batch size 32 on a GPU and 16 on cpu. With Jina, the default `--rerank-block-tokens 4096` fits a
+16 GB GPU and stays on cpu, since the ranking depends on it, and `--rerank-revision` defaults to
+the baseline's `e8a93f33f0b2`; qwen3 has neither default.
 
 The extractor can be switched per query in the UI:
 - `crossencoder` is the default, at `--ce-threshold 0.5`.

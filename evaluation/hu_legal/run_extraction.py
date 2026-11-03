@@ -13,9 +13,9 @@ Two modes:
   passage (so they cannot hold its text), seeded per qid. A judge that says yes to
   everything then shows up as a high distractor_answer_rate.
 - retrieved: every query of the split, unanswerable ones included, goes through retrieval
-  (fused when both providers run), optional Jina v3.5 rerank, and extraction on the top
-  --extract-k chunks. The index is built fresh under data/index/<tag>/ (refused if that holds
-  a completed index, unless --overwrite), or reused with --index-tag when its index_meta.json
+  (fused when both providers run), optional rerank (--reranker jina|qwen3), and extraction on
+  the top --extract-k chunks. The index is built fresh under data/index/<tag>/ (refused if that
+  holds a completed index, unless --overwrite), or reused with --index-tag when its index_meta.json
   matches the corpus content and provider settings and the stored row count matches.
 
 Queries annotated as not answered by their own passage (`excluded`) are never scored.
@@ -99,17 +99,21 @@ from evaluation.hu_legal.run_retrieval import (
     RUNS,
     QueryCache,
     add_accent_args,
+    add_rerank_args,
     apply_query_accents,
     build_index,
     check_folded_meta,
+    check_rerank_args,
     count_unaccented,
     folded_meta,
     fusion_weights,
     git_sha,
     index_meta,
     load_split,
+    make_reranker,
     open_folded_index,
     read_jsonl,
+    rerank_config,
     write_index_meta,
 )
 
@@ -675,15 +679,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     g.add_argument("--dense-revision", help="HF commit sha to pin the dense model")
     g.add_argument("--query-instruction", help="English task text replacing Qwen's query prompt")
     g.add_argument("--device", default="cpu", help="Device for the dense model and reranker")
-    g.add_argument("--rerank", action="store_true", help="Rerank with Jina reranker v3.5")
-    g.add_argument("--rerank-model", default="jinaai/jina-reranker-v3.5")
-    g.add_argument("--rerank-revision", help="HF commit sha to pin the reranker (remote code)")
-    g.add_argument(
-        "--rerank-block-tokens",
-        type=int,
-        help="Approximate cap on tokens per reranker forward pass (4096 fits a 16 GB GPU); "
-        "default: all candidates in one pass",
-    )
+    g.add_argument("--rerank", action="store_true", help="Rerank the retrieved chunks")
+    add_rerank_args(g)
     g.add_argument(
         "--bm25-model",
         default="hu_core_news_lg",
@@ -710,8 +707,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         p.error("--distractors takes N >= 0 and only applies to --mode oracle")
     if args.extract_k < 1 or args.retrieve_k < args.extract_k:
         p.error("need 1 <= --extract-k <= --retrieve-k")
-    if args.rerank_block_tokens is not None and not args.rerank:
-        p.error("--rerank-block-tokens needs --rerank")
+    check_rerank_args(p, args, enabled=args.rerank)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     started = datetime.now(timezone.utc)
@@ -787,18 +783,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 )
             )
         if args.rerank:
-            if not args.rerank_revision:
-                logger.warning("--rerank without --rerank-revision: remote code is not pinned")
-            from verbatim_rag.rerankers import JinaV3Reranker
-
-            reranker = JinaV3Reranker(
-                model=args.rerank_model,
-                rerank_k=args.retrieve_k,
-                device=args.device,
-                revision=args.rerank_revision,
-                max_block_tokens=args.rerank_block_tokens,
-                restore_accents=not args.no_accent_restore,
-            )
+            reranker = make_reranker(args, args.retrieve_k)
 
     # Load the extractor before indexing so a bad model id fails in seconds, not hours.
     extractor = make_extractor(args, nlp=sparse._provider.nlp if sparse else None)
@@ -982,11 +967,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "extract_k": args.extract_k,
                 "rerank": None
                 if reranker is None
-                else {
-                    "model": args.rerank_model,
-                    "revision": args.rerank_revision,
-                    "max_block_tokens": args.rerank_block_tokens,
-                },
+                else rerank_config(args, reranker, args.retrieve_k),
                 "device": args.device,
             },
         },

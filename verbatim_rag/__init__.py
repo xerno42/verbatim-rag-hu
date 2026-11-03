@@ -25,6 +25,7 @@ from verbatim_rag.rerankers import BaseReranker as BaseReranker
 from verbatim_rag.rerankers import CohereReranker as CohereReranker
 from verbatim_rag.rerankers import JinaReranker as JinaReranker
 from verbatim_rag.rerankers import JinaV3Reranker as JinaV3Reranker
+from verbatim_rag.rerankers import Qwen3Reranker as Qwen3Reranker
 from verbatim_rag.rerankers import Reranker as Reranker
 from verbatim_rag.rerankers import SentenceTransformersReranker as SentenceTransformersReranker
 from verbatim_rag.schema import DocumentSchema as DocumentSchema

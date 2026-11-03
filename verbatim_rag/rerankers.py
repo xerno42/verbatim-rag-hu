@@ -244,3 +244,147 @@ class JinaV3Reranker(BaseReranker):
                 f"Jina reranker returned {len(order)} indices for {len(head)} documents"
             )
         return [head[i] for i in order] + tail
+
+
+class Qwen3Reranker(BaseReranker):
+    """Local Qwen3 pointwise reranker (``Qwen/Qwen3-Reranker-0.6B`` by default, Apache-2.0).
+
+    The model is a plain causal LM (no remote code): each (instruction, question, document)
+    prompt is scored on its own as P("yes") against P("no") at the last position, following the
+    model card. Unlike the listwise ``JinaV3Reranker``, scores are comparable across calls and
+    memory grows with ``batch_size`` (times the square of the longest prompt in the batch), not
+    with the number of candidates, so no block packing is needed. ``max_length`` caps each
+    prompt; a longer document loses its tail (logged).
+
+    On cpu the model runs in float32: bf16 is ~4x slower there and makes a chunk's score depend
+    on its batch (~1e-3). On other devices it loads in the checkpoint's dtype (bf16).
+
+    The card recommends English instructions for multilingual use, so the default task
+    instruction is English while the question and documents stay Hungarian.
+
+    With ``restore_accents`` (default), a question without any diacritic is reranked with its
+    accents restored from the candidates' word forms (``hungarian_accents.restore_accents``);
+    accented questions are passed through unchanged.
+    """
+
+    DEFAULT_INSTRUCTION = (
+        "Given a question in Hungarian about a legal text, "
+        "retrieve passages that answer the question"
+    )
+    # Prompt template from the model card.
+    _PREFIX = (
+        "<|im_start|>system\nJudge whether the Document meets the requirements based on the "
+        'Query and the Instruct provided. Note that the answer can only be "yes" or "no".'
+        "<|im_end|>\n<|im_start|>user\n"
+    )
+    _SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    def __init__(
+        self,
+        model: str = "Qwen/Qwen3-Reranker-0.6B",
+        rerank_k: int = 100,
+        text_field: str = "text",
+        device: Optional[str] = None,
+        revision: Optional[str] = None,
+        instruction: str = DEFAULT_INSTRUCTION,
+        batch_size: int = 16,
+        max_length: int = 8192,
+        restore_accents: bool = True,
+    ):
+        super().__init__(rerank_k=rerank_k, text_field=text_field)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if not instruction.strip():
+            raise ValueError("instruction must not be empty")
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise ImportError("pip install torch transformers") from exc
+        self._torch = torch
+        self.model_name = model
+        self.revision = revision
+        self.instruction = instruction
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self.restore_accents = restore_accents
+        # Left padding puts every prompt's last token at position -1.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model, revision=revision, padding_side="left"
+        )
+        self._prefix_ids = self.tokenizer.encode(self._PREFIX, add_special_tokens=False)
+        self._suffix_ids = self.tokenizer.encode(self._SUFFIX, add_special_tokens=False)
+        self._pair_budget = max_length - len(self._prefix_ids) - len(self._suffix_ids)
+        if self._pair_budget <= 0:
+            raise ValueError(f"max_length={max_length} leaves no room for the prompt")
+        self._yes_id = self.tokenizer.convert_tokens_to_ids("yes")
+        self._no_id = self.tokenizer.convert_tokens_to_ids("no")
+        unk = getattr(self.tokenizer, "unk_token_id", None)
+        if (
+            not isinstance(self._yes_id, int)
+            or not isinstance(self._no_id, int)
+            or self._yes_id == self._no_id
+            or unk is not None
+            and unk in (self._yes_id, self._no_id)
+        ):
+            raise ValueError(f"{model} has no distinct 'yes'/'no' tokens; not a Qwen3 reranker")
+        on_cpu = device is None or str(device) == "cpu"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model,
+            # transformers is pinned to 4.53.3, which predates the `dtype` alias (4.56)
+            torch_dtype=torch.float32 if on_cpu else "auto",
+            revision=revision,
+        )
+        if device is not None:
+            self.model.to(device)
+        self.model.eval()
+
+    def _format(self, question: str, document: str) -> str:
+        return f"<Instruct>: {self.instruction}\n<Query>: {question}\n<Document>: {document}"
+
+    def score(self, question: str, texts: List[str]) -> List[float]:
+        """P(yes) in [0, 1] for each text, in input order."""
+        torch = self._torch
+        scores: List[float] = []
+        for start in range(0, len(texts), self.batch_size):
+            pairs = [self._format(question, t) for t in texts[start : start + self.batch_size]]
+            encoded = self.tokenizer(
+                pairs,
+                padding=False,
+                truncation="longest_first",
+                return_attention_mask=False,
+                max_length=self._pair_budget,
+            )
+            truncated = sum(len(x) >= self._pair_budget for x in encoded["input_ids"])
+            if truncated:
+                logger.warning(
+                    "%d prompt(s) reached max_length=%d; longer documents lose their tail",
+                    truncated,
+                    self.max_length,
+                )
+            ids = [self._prefix_ids + x + self._suffix_ids for x in encoded["input_ids"]]
+            batch = self.tokenizer.pad({"input_ids": ids}, padding=True, return_tensors="pt")
+            batch = {k: v.to(self.model.device) for k, v in batch.items()}
+            with torch.inference_mode():
+                # Only the last position's logits are needed, and no KV cache: both would
+                # otherwise cost batch x length x vocab (151k) and 28 layers of memory.
+                logits = self.model(**batch, logits_to_keep=1, use_cache=False).logits[:, -1, :]
+            pair = torch.stack([logits[:, self._no_id], logits[:, self._yes_id]], dim=1)
+            probs = torch.log_softmax(pair.float(), dim=1)[:, 1].exp()
+            if not torch.isfinite(probs).all():
+                raise ValueError(f"Qwen3 reranker returned non-finite scores: {probs.tolist()}")
+            scores.extend(probs.tolist())
+        return scores
+
+    def rerank(self, question: str, results: List[SearchResult]) -> List[SearchResult]:
+        head, tail = self._split_results(results)
+        if not head:
+            return results
+        texts = self._get_texts(head)
+        if self.restore_accents:
+            # A question typed without accents gets them back from the candidates' word forms.
+            question = _restore_accents(question, texts)
+        scores = self.score(question, texts)
+        # Stable sort: ties keep their retrieval order.
+        order = sorted(range(len(head)), key=lambda i: -scores[i])
+        return [head[i] for i in order] + tail

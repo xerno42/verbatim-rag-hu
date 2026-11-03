@@ -14,7 +14,7 @@ components through its existing interfaces:
 |---|---|---|
 | Dense embeddings | MiniLM-class sentence-transformers | `Qwen/Qwen3-Embedding-0.6B` |
 | Sparse embeddings | SPLADE | Hungarian BM25 over HuSpaCy lemmas |
-| Reranker | English cross-encoder | `jinaai/jina-reranker-v3.5` |
+| Reranker | English cross-encoder | `jinaai/jina-reranker-v3.5` (or `Qwen/Qwen3-Reranker-0.6B`) |
 | Span extractor | LLM or ModernBERT span model | HuSpaCy sentence split + `BAAI/bge-reranker-v2-m3` or an LLM as a sentence judge |
 
 Everything runs on one machine with Milvus Lite. The evaluation set is the
@@ -47,7 +47,7 @@ pip install https://huggingface.co/huspacy/hu_core_news_lg/resolve/main/hu_core_
 
 The demo frontend needs Node.js: `cd frontend && npm install`.
 
-Model weights (Qwen3-Embedding, Jina reranker, bge-reranker) are downloaded from
+Model weights (Qwen3-Embedding, Jina or Qwen3 reranker, bge-reranker) are downloaded from
 Hugging Face on first use.
 
 ```bash
@@ -62,7 +62,7 @@ ruff format --check packages/core/verbatim_core/ verbatim_rag/ api/ tests/
 |---|---|
 | [verbatim_rag/hungarian_bm25.py](verbatim_rag/hungarian_bm25.py) | `HungarianBM25Provider`: client-side BM25 over HuSpaCy lemmas |
 | [verbatim_rag/qwen3_embedding.py](verbatim_rag/qwen3_embedding.py) | `Qwen3EmbeddingProvider`: dense provider with the Qwen3 query prompt |
-| [verbatim_rag/rerankers.py](verbatim_rag/rerankers.py) | `JinaV3Reranker` (plus the upstream rerankers) |
+| [verbatim_rag/rerankers.py](verbatim_rag/rerankers.py) | `JinaV3Reranker`, `Qwen3Reranker` (plus the upstream rerankers) |
 | [verbatim_rag/cross_encoder_extractor.py](verbatim_rag/cross_encoder_extractor.py) | `CrossEncoderSentenceExtractor`: sentence-level span extractor |
 | [verbatim_rag/](verbatim_rag/) (rest) | Upstream pipeline: `VerbatimRAG`, `VerbatimIndex`, ingestion, vector stores, templates |
 | [packages/core/verbatim_core/](packages/core/verbatim_core/) | Upstream lightweight core: span extractors, `LLMClient`, templates, response builder |
@@ -143,7 +143,8 @@ Practical notes:
   newer aliases such as `dtype`), `milvus-lite<3` and `setuptools<81` (see the
   comments in [pyproject.toml](pyproject.toml)).
 - **Licences.** The Jina reranker is CC-BY-NC-4.0 and the eval data is CC BY-NC-ND 4.0.
-  Both make this fork a non-commercial research setup. The code is MIT.
+  Both make this fork a non-commercial research setup. The code is MIT. The Qwen3
+  reranker (`--reranker qwen3`) is Apache-2.0.
 
 ## How it works
 
@@ -226,6 +227,14 @@ shared query embedding to bound memory; rankings differ from a single pass, so r
 with different values are not directly comparable. The tail past `rerank_k` keeps
 its retrieval order, and the model revision can be pinned with `--rerank-revision`
 (the demo pins `e8a93f33f0b2`).
+
+`Qwen3Reranker` (`--reranker qwen3`, `Qwen/Qwen3-Reranker-0.6B`, Apache-2.0) is the
+alternative. It is a plain causal LM with no remote code that scores each
+(instruction, question, chunk) prompt on its own as P("yes") against P("no"), following
+the model card. Memory grows with `--rerank-batch-size`, not with the number of
+candidates, so it needs no blocking. The task instruction is English, as the card
+recommends, and `--rerank-instruction` replaces it. Ties keep their retrieval order. It
+has not been measured on the eval set yet.
 
 **Sentence-level extraction.** `CrossEncoderSentenceExtractor` scores each sentence
 independently with `BAAI/bge-reranker-v2-m3` (multilingual, Apache-2.0) through a

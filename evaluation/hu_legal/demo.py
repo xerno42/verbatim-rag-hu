@@ -7,11 +7,11 @@ Local demo of the Hungarian pipeline on the eval set, served to the React UI in 
     cd frontend && npm install && npm run dev     # http://localhost:3000, proxies /api to :8000
 
 The pipeline is the one `run_extraction --mode retrieved --rerank` measures: fused Hungarian
-BM25 + Qwen3 retrieval of --retrieve-k chunks, Jina v3.5 rerank, extraction on the top
---extract-k chunks, and a static Hungarian template (no LLM writes framing text). Defaults
-fit a 16 GB GPU (--device cuda --batch-size 32 --rerank-block-tokens 4096). Without a GPU the
-device falls back to cpu and the batch sizes to 16; the rerank block size stays 4096, since
-rankings depend on it.
+BM25 + Qwen3 retrieval of --retrieve-k chunks, rerank (Jina v3.5 by default, or
+--reranker qwen3 for Qwen3-Reranker-0.6B), extraction on the top --extract-k chunks, and a
+static Hungarian template (no LLM writes framing text). Defaults fit a 16 GB GPU (--device cuda
+--batch-size 32 --rerank-block-tokens 4096). Without a GPU the device falls back to cpu and the
+batch sizes to 16; Jina's rerank block size stays 4096, since rankings depend on it.
 
 Each request picks one of the loaded extractors (the UI has a toggle):
 
@@ -74,12 +74,16 @@ from evaluation.hu_legal.run_retrieval import (
     DATA,
     FOLDED,
     INDEX_META,
+    RERANK_MODELS,
     QueryCache,
+    add_rerank_args,
     check_folded_meta,
+    check_rerank_args,
     folded_meta,
     fusion_weights,
     index_meta,
     load_split,
+    make_reranker,
     open_folded_index,
     read_jsonl,
 )
@@ -91,6 +95,7 @@ ABSTAIN_HU = "A rendelkezésre álló dokumentumok nem tartalmaznak választ err
 TEMPLATE_HU = "## Válasz\n\nSzó szerinti részletek a forrásdokumentumokból:\n\n[DISPLAY_SPANS]"
 # The revision the baseline retrieval run used; JinaV3Reranker's block arithmetic mirrors it.
 RERANK_REVISION = "e8a93f33f0b22108f8c2364f8484ce3422552fbc"
+JINA_BLOCK_TOKENS = 4096  # fits a 16 GB GPU; the baseline ranking depends on it
 MAX_QUESTION_CHARS = 1000
 # What /api/demo/queries exposes per query: no passage text, no source chunk id.
 QUERY_FIELDS = (
@@ -417,7 +422,6 @@ def prepare_index_dir(args, corpus) -> tuple:
 def build_pipelines(args) -> Dict[str, Any]:
     from verbatim_rag.hungarian_bm25 import HungarianBM25Provider
     from verbatim_rag.qwen3_embedding import Qwen3EmbeddingProvider
-    from verbatim_rag.rerankers import JinaV3Reranker
 
     corpus = read_jsonl(args.data_dir / "corpus.jsonl")
     run_dir, reuse = prepare_index_dir(args, corpus)
@@ -438,14 +442,7 @@ def build_pipelines(args) -> Dict[str, Any]:
             revision=args.dense_revision,
         )
     )
-    reranker = JinaV3Reranker(
-        model=args.rerank_model,
-        rerank_k=args.retrieve_k,
-        device=args.device,
-        revision=args.rerank_revision,
-        max_block_tokens=args.rerank_block_tokens,
-        restore_accents=not args.no_accent_restore,
-    )
+    reranker = make_reranker(args, args.retrieve_k)
     # Load the extractors before indexing so a bad model id or key fails in seconds.
     extractors = make_extractors(args, nlp=sparse._provider.nlp)
     logger.info("%s index in %s", "reusing" if reuse else "building", run_dir)
@@ -514,6 +511,18 @@ def resolve_device_defaults(args) -> None:
         args.ce_batch_size = _default_batch_size(args.ce_device or args.device)
 
 
+def resolve_rerank_defaults(args) -> None:
+    """jina runs as in the baseline (pinned revision, 4096-token blocks) unless overridden, in
+    place; qwen3 has no such defaults."""
+    if args.reranker != "jina":
+        return
+    # The pinned sha belongs to the default Jina model; another --rerank-model gets none.
+    if args.rerank_revision is None and args.rerank_model == RERANK_MODELS["jina"]:
+        args.rerank_revision = RERANK_REVISION
+    if args.rerank_block_tokens is None:
+        args.rerank_block_tokens = JINA_BLOCK_TOKENS
+
+
 def parse_extractors(value: str) -> List[str]:
     names = [v.strip() for v in value.split(",") if v.strip()]
     unknown = [n for n in names if n not in EXTRACTORS]
@@ -530,6 +539,7 @@ def demo_info(args, n_queries: int) -> Dict[str, Any]:
         "retrieve_k": args.retrieve_k,
         "extract_k": args.extract_k,
         "dense_model": args.dense_model,
+        "reranker": args.reranker,
         "rerank_model": args.rerank_model,
         "folded_weight": args.folded_weight if args.folded else None,
         "accent_restore": not args.no_accent_restore,
@@ -614,16 +624,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         "the cross-encoder",
     )
     g.add_argument("--rrf-k", type=int, default=60)
-    g.add_argument("--rerank-model", default="jinaai/jina-reranker-v3.5")
-    g.add_argument("--rerank-revision", default=RERANK_REVISION)
-    g.add_argument(
-        "--rerank-block-tokens",
-        type=int,
-        default=4096,
-        help="Approximate cap on tokens per reranker forward pass (4096 fits a 16 GB GPU and is "
-        "kept on cpu: the ranking depends on it, so other values are not comparable to the baseline)",
+    add_rerank_args(
+        g,
+        block_tokens_default=f"{JINA_BLOCK_TOKENS}, also on cpu: the ranking depends on it, so "
+        "other values are not comparable to the baseline",
+        revision_default=f"the baseline's {RERANK_REVISION[:12]} for the default jina model, "
+        "else latest (unpinned)",
     )
     args = p.parse_args(argv)
+    check_rerank_args(p, args)
+    resolve_rerank_defaults(args)
     resolve_device_defaults(args)
     if args.extract_k < 1 or args.retrieve_k < args.extract_k:
         p.error("need 1 <= --extract-k <= --retrieve-k")

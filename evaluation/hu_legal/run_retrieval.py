@@ -11,7 +11,8 @@ is the r-th result. Reported per method: Recall@10, Recall@100 and MRR@100, over
 split by query_type, legal_domain, difficulty and bucket.
 
 With --rerank, the top-100 of the fused list (or of the single method when only one provider
-runs) is reranked by Jina reranker v3.5 and reported as a fourth method, "reranked". It is a
+runs) is reranked by --reranker (jina: jina-reranker-v3.5, the default; qwen3:
+Qwen3-Reranker-0.6B) and reported as a fourth method, "reranked". It is a
 permutation of the same 100 candidates, so its Recall@100 equals its input's; Recall@10 and
 MRR are what change. Extraction and abstention are measured by run_extraction.
 
@@ -350,6 +351,124 @@ def count_unaccented(queries: List[Dict[str, Any]]) -> int:
     return sum(not has_diacritics(q["query"]) for q in queries)
 
 
+# ---- reranker --------------------------------------------------------------
+
+RERANK_MODELS = {"jina": "jinaai/jina-reranker-v3.5", "qwen3": "Qwen/Qwen3-Reranker-0.6B"}
+DEFAULT_RERANKER = "jina"
+# Every flag add_rerank_args defines; all default to None so check_rerank_args sees what was set.
+_RERANK_FLAGS = ("reranker", "model", "revision", "block_tokens", "batch_size", "instruction")
+
+
+def add_rerank_args(
+    p,
+    block_tokens_default: str = "all candidates in one pass",
+    revision_default: str = "latest (unpinned)",
+) -> None:
+    """Reranker choice and settings, shared by run_retrieval, run_extraction and the demo
+    (which fills in its own jina defaults after parsing, described by the *_default texts)."""
+    p.add_argument(
+        "--reranker",
+        choices=sorted(RERANK_MODELS),
+        help=f"jina: listwise jina-reranker-v3.5 (CC-BY-NC-4.0, remote code); qwen3: pointwise "
+        f"Qwen3-Reranker-0.6B (Apache-2.0). Default: {DEFAULT_RERANKER}",
+    )
+    p.add_argument("--rerank-model", help="HF model id (default: the --reranker's model)")
+    p.add_argument(
+        "--rerank-revision", help=f"HF commit sha to pin the reranker; default: {revision_default}"
+    )
+    p.add_argument(
+        "--rerank-block-tokens",
+        type=int,
+        help="jina only: approximate cap on tokens per reranker forward pass (4096 fits a 16 GB "
+        f"GPU); default: {block_tokens_default}",
+    )
+    p.add_argument(
+        "--rerank-batch-size",
+        type=int,
+        help="qwen3 only: (question, chunk) prompts per forward pass "
+        "(default: Qwen3Reranker's, 16)",
+    )
+    p.add_argument(
+        "--rerank-instruction",
+        help="qwen3 only: English task instruction replacing Qwen3Reranker.DEFAULT_INSTRUCTION",
+    )
+
+
+def check_rerank_args(p, args, enabled: bool = True) -> None:
+    """Reject flags of the other reranker (or any, when reranking is off) and fill in the
+    reranker and model id, in place."""
+    if not enabled:
+        for flag in _RERANK_FLAGS:
+            attr = flag if flag == "reranker" else f"rerank_{flag}"
+            if getattr(args, attr) is not None:
+                p.error(f"--{attr.replace('_', '-')} needs --rerank")
+    if args.reranker is None:
+        args.reranker = DEFAULT_RERANKER
+    if args.reranker == "qwen3" and args.rerank_block_tokens is not None:
+        p.error("--rerank-block-tokens only applies to --reranker jina")
+    if args.reranker == "jina":
+        if args.rerank_batch_size is not None:
+            p.error("--rerank-batch-size only applies to --reranker qwen3")
+        if args.rerank_instruction is not None:
+            p.error("--rerank-instruction only applies to --reranker qwen3")
+    if args.rerank_batch_size is not None and args.rerank_batch_size <= 0:
+        p.error("--rerank-batch-size must be positive")
+    if args.rerank_instruction is not None and not args.rerank_instruction.strip():
+        p.error("--rerank-instruction must not be empty")
+    if args.rerank_model is None:
+        args.rerank_model = RERANK_MODELS[args.reranker]
+
+
+def make_reranker(args, rerank_k: int):
+    """The reranker check_rerank_args validated, on args.device."""
+    restore = not args.no_accent_restore
+    if args.reranker == "qwen3":
+        if not args.rerank_revision:
+            logger.warning("reranker without --rerank-revision: weights are not pinned")
+        from verbatim_rag.rerankers import Qwen3Reranker
+
+        # Unset options keep Qwen3Reranker's own defaults.
+        optional = {"instruction": args.rerank_instruction, "batch_size": args.rerank_batch_size}
+        return Qwen3Reranker(
+            model=args.rerank_model,
+            rerank_k=rerank_k,
+            device=args.device,
+            revision=args.rerank_revision,
+            restore_accents=restore,
+            **{k: v for k, v in optional.items() if v is not None},
+        )
+    if not args.rerank_revision:
+        logger.warning("reranker without --rerank-revision: remote code is not pinned")
+    from verbatim_rag.rerankers import JinaV3Reranker
+
+    return JinaV3Reranker(
+        model=args.rerank_model,
+        rerank_k=rerank_k,
+        device=args.device,
+        revision=args.rerank_revision,
+        max_block_tokens=args.rerank_block_tokens,
+        restore_accents=restore,
+    )
+
+
+def rerank_config(args, reranker, rerank_k: int) -> Dict[str, Any]:
+    """Run-log entry for the reranker make_reranker built."""
+    config: Dict[str, Any] = {
+        "reranker": args.reranker,
+        "model": args.rerank_model,
+        "revision": args.rerank_revision,  # None = latest at run time; pin it
+        "rerank_k": rerank_k,
+    }
+    if args.reranker == "qwen3":
+        config["batch_size"] = reranker.batch_size
+        config["max_length"] = reranker.max_length
+        config["instruction"] = reranker.instruction
+        config["dtype"] = str(reranker.model.dtype)  # float32 on cpu, else the checkpoint's
+    else:
+        config["max_block_tokens"] = args.rerank_block_tokens
+    return config
+
+
 # ---- run -------------------------------------------------------------------
 
 
@@ -423,18 +542,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--dense-revision", help="HF commit sha to pin the dense model")
     p.add_argument("--query-instruction", help="English task text replacing Qwen's query prompt")
     p.add_argument("--device", default="cpu")
-    p.add_argument(
-        "--rerank", action="store_true", help="Rerank the top-100 with Jina reranker v3.5"
-    )
-    p.add_argument("--rerank-model", default="jinaai/jina-reranker-v3.5")
-    p.add_argument("--rerank-revision", help="HF commit sha to pin the reranker (remote code)")
+    p.add_argument("--rerank", action="store_true", help="Rerank the top-100 with --reranker")
     p.add_argument("--rerank-k", type=int, default=max(CUTOFFS), help="Candidates reranked")
-    p.add_argument(
-        "--rerank-block-tokens",
-        type=int,
-        help="Approximate cap on tokens per reranker forward pass (4096 fits a 16 GB GPU); "
-        "default: all candidates in one pass",
-    )
+    add_rerank_args(p)
     p.add_argument("--bm25-model", default="hu_core_news_lg")
     p.add_argument("--k1", type=float, default=1.2)
     p.add_argument("--b", type=float, default=0.75)
@@ -452,8 +562,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     p.add_argument("--runs-dir", type=Path, default=RUNS)
     args = p.parse_args(argv)
-    if args.rerank_block_tokens is not None and not args.rerank:
-        p.error("--rerank-block-tokens needs --rerank")
+    check_rerank_args(p, args, enabled=args.rerank)
     if args.skip_dense and args.skip_sparse:
         p.error("nothing to run: both providers skipped")
     if args.folded and (args.skip_dense or args.skip_sparse):
@@ -515,18 +624,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Load before indexing so a bad model id or offline machine fails in seconds, not hours.
     reranker = None
     if args.rerank:
-        if not args.rerank_revision:
-            logger.warning("--rerank without --rerank-revision: remote code is not pinned")
-        from verbatim_rag.rerankers import JinaV3Reranker
-
-        reranker = JinaV3Reranker(
-            model=args.rerank_model,
-            rerank_k=args.rerank_k,
-            device=args.device,
-            revision=args.rerank_revision,
-            max_block_tokens=args.rerank_block_tokens,
-            restore_accents=not args.no_accent_restore,
-        )
+        reranker = make_reranker(args, args.rerank_k)
     db_path = run_dir / "milvus.db"
     t0 = time.time()
     index = build_index(corpus, db_path, sparse, dense, args.batch_size)
@@ -590,10 +688,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             "rerank": None
             if reranker is None
             else {
-                "model": args.rerank_model,
-                "revision": args.rerank_revision,  # None = latest at run time; pin it
-                "rerank_k": args.rerank_k,
-                "max_block_tokens": args.rerank_block_tokens,
+                **rerank_config(args, reranker, args.rerank_k),
                 "source": rerank_source(methods),
             },
             "cutoffs": list(CUTOFFS),
